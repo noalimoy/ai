@@ -30,6 +30,7 @@ mod state_owner_headers;
 pub mod store;
 pub mod subrequest;
 pub mod token_cache;
+pub mod vertex;
 pub(crate) mod web_search;
 
 pub use callout_credentials::{CalloutCredentials, CalloutCredentialsFilter};
