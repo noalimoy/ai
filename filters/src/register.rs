@@ -478,8 +478,8 @@ mod tests {
             "anthropic_web_search",
             "request_id",
             "aws_sigv4_sign",
-            "openai_chat_completions_to_vertexai_gemini",
             "openai_chat_completions_to_azureai_chat_completions",
+            "openai_chat_completions_to_vertexai_gemini",
         ];
         for name in expected {
             assert!(names.contains(&name), "expected {name} in registry");

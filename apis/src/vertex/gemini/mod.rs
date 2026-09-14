@@ -52,11 +52,11 @@ pub(super) const FALLBACK_RESPONSE_ID: &str = "chatcmpl-vertex";
 struct StreamState {
     /// Byte-level SSE frame reassembly parser.
     parser: SseFrameParser,
-    /// Whether the next frame is the first one (includes `role` in delta).
-    is_first_chunk: bool,
-    /// Unix timestamp (seconds) fixed at stream start so every chunk
-    /// reports the same `created` value, matching OpenAI behavior.
-    created: u64,
+    /// Sticky completion id and tool-call slots for this stream.
+    translate: response::StreamTranslateState,
+    /// Set when a parse or translation error was encountered during the
+    /// stream. Checked at `end_of_stream` to emit an error frame.
+    had_error: bool,
 }
 
 // -----------------------------------------------------------------------------
@@ -159,7 +159,7 @@ impl HttpFilter for OpenaiChatCompletionsToVertexaiGeminiFilter {
         }
 
         let Some(bytes) = body.as_ref().filter(|b| !b.is_empty()) else {
-            return Ok(FilterAction::Continue);
+            return Ok(FilterAction::Reject(build_request_rejection("request body is empty")));
         };
 
         match request::transform_request(bytes) {
@@ -307,22 +307,32 @@ fn translate_sse_chunk(
     end_of_stream: bool,
     max_body_bytes: usize,
 ) {
-    let Some(bytes) = body.as_ref().filter(|b| !b.is_empty()) else {
-        if end_of_stream {
-            *body = Some(Bytes::from_static(SSE_DONE));
-        }
+    let bytes = body.as_ref().filter(|b| !b.is_empty());
+
+    // Nothing to parse and not closing — nothing to do.
+    if bytes.is_none() && !end_of_stream {
         return;
-    };
+    }
 
     let mut state = ctx.remove_filter_state::<StreamState>().unwrap_or_else(|| StreamState {
         parser: SseFrameParser::new(max_body_bytes),
-        is_first_chunk: true,
-        created: response::created_timestamp(),
+        translate: response::StreamTranslateState::new(),
+        had_error: false,
     });
 
-    let mut output = translate_sse_frames(ctx, &mut state, bytes);
+    let mut output = match bytes {
+        Some(b) => translate_sse_frames(ctx, &mut state, b),
+        None => Vec::new(),
+    };
 
     if end_of_stream {
+        if state.had_error || state.parser.has_incomplete_frame() {
+            append_stream_error_frame(&mut output);
+        }
+        // Always emit [DONE] even after an error frame. The error frame
+        // causes SDK clients (OpenAI Python, etc.) to raise before they
+        // see [DONE]. For naive consumers that skip unrecognized frames,
+        // [DONE] prevents an indefinite hang.
         output.extend_from_slice(SSE_DONE);
     } else {
         ctx.insert_filter_state(state);
@@ -337,47 +347,64 @@ fn translate_sse_chunk(
 
 /// Parse and translate SSE frames from a raw byte chunk.
 ///
-/// On parse error, returns an empty buffer and preserves `state`
-/// for the next call.
+/// On parse error, marks `state.had_error` and returns an empty buffer.
+/// Note: `SseFrameParser` fails closed — a `BufferOverflow` mid-chunk
+/// discards the entire chunk, including any frames that completed before
+/// the overflow. This is intentional: partial recovery from a corrupted
+/// byte stream risks emitting truncated JSON to the client.
 fn translate_sse_frames(ctx: &HttpFilterContext<'_>, state: &mut StreamState, bytes: &Bytes) -> Vec<u8> {
     let model = ctx.get_metadata(REQUEST_MODEL_KEY).unwrap_or("unknown");
-    let id = FALLBACK_RESPONSE_ID;
 
     match state.parser.parse_chunk(bytes) {
-        Ok(frames) => render_sse_frames(&frames, model, id, state),
+        Ok(frames) => render_sse_frames(&frames, model, state),
         Err(e) => {
             debug!(error = %e, "SSE parse error in vertex gemini filter");
+            state.had_error = true;
             Vec::new()
         },
     }
 }
 
 /// Render parsed SSE frames into translated OpenAI SSE output bytes.
-fn render_sse_frames(
-    frames: &[crate::openai::sse::SseFrame],
-    model: &str,
-    id: &str,
-    state: &mut StreamState,
-) -> Vec<u8> {
+///
+/// Sets `state.had_error` when any individual frame fails to translate.
+fn render_sse_frames(frames: &[crate::openai::sse::SseFrame], model: &str, state: &mut StreamState) -> Vec<u8> {
     let mut output = Vec::new();
     for frame in frames {
         if frame.data == b"[DONE]" {
             output.extend_from_slice(b"data: [DONE]\n\n");
             continue;
         }
-        match response::transform_stream_chunk(&frame.data, model, id, state.is_first_chunk, state.created) {
+        match response::transform_stream_chunk(&frame.data, model, &mut state.translate) {
             Ok(translated) => {
-                state.is_first_chunk = false;
+                state.translate.is_first_chunk = false;
                 output.extend_from_slice(b"data: ");
                 output.extend_from_slice(&translated);
                 output.extend_from_slice(b"\n\n");
             },
             Err(e) => {
                 debug!(error = e.as_str(), "failed to translate Gemini SSE frame");
+                state.had_error = true;
             },
         }
     }
     output
+}
+
+/// Append an OpenAI-shaped error SSE frame to `output`.
+///
+/// Emitted just before `[DONE]` when the upstream stream contained parse
+/// or translation errors, or when the connection closed with an
+/// incomplete SSE frame still buffered.
+fn append_stream_error_frame(output: &mut Vec<u8>) {
+    let frame = wire::build_openai_error_body(
+        "upstream SSE stream ended with errors or was truncated",
+        "server_error",
+        "server_error",
+    );
+    output.extend_from_slice(b"data: ");
+    output.extend_from_slice(&frame);
+    output.extend_from_slice(b"\n\n");
 }
 
 /// Normalize a Vertex AI error response to the OpenAI error envelope.
@@ -654,6 +681,22 @@ mod tests {
         assert!(ctx.rewritten_path.is_none(), "path should not be rewritten before EOS");
     }
 
+    #[tokio::test]
+    async fn on_request_body_empty_at_eos_rejects() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
+        let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
+        let req = make_request(Method::POST, "/v1/chat/completions");
+        let mut ctx = make_filter_context(&req);
+        let mut body = Some(Bytes::new());
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(
+            matches!(action, FilterAction::Reject(_)),
+            "empty body at EOS should be rejected"
+        );
+    }
+
     // --- on_response + on_response_body: error normalization ---
 
     #[tokio::test]
@@ -822,6 +865,7 @@ mod tests {
         let mut ctx = make_filter_context(&req);
         ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
         ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
+        ctx.current_filter_id = Some(0);
 
         // Final chunk with data AND end_of_stream=true: should
         // translate the frame AND append [DONE].
@@ -833,6 +877,266 @@ mod tests {
         let output = std::str::from_utf8(output_bytes.as_ref()).unwrap();
         assert!(output.contains("data: {"), "should contain translated frame");
         assert!(output.ends_with("data: [DONE]\n\n"), "should end with [DONE] sentinel");
+    }
+
+    fn parse_sse_json_payloads(output: &str) -> Vec<serde_json::Value> {
+        output
+            .split("\n\n")
+            .filter_map(|frame| {
+                let data = frame.strip_prefix("data: ")?;
+                if data.trim() == "[DONE]" {
+                    return None;
+                }
+                serde_json::from_str(data.trim()).ok()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn sse_two_frames_assign_stable_tool_call_indices() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
+        let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
+        let req = make_request(Method::POST, "/v1/chat/completions");
+        let mut ctx = make_filter_context(&req);
+        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
+        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
+        ctx.current_filter_id = Some(0);
+
+        let mut body = Some(Bytes::from_static(
+            b"data: {\"responseId\":\"resp-s\",\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{}}}]}}]}\n\n",
+        ));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let first = parse_sse_json_payloads(std::str::from_utf8(body.as_ref().unwrap()).unwrap());
+
+        let mut body = Some(Bytes::from_static(
+            b"data: {\"responseId\":\"resp-s\",\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_calendar\",\"args\":{}}}]}}]}\n\n",
+        ));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let second = parse_sse_json_payloads(std::str::from_utf8(body.as_ref().unwrap()).unwrap());
+
+        let weather = &first[0]["choices"][0]["delta"]["tool_calls"][0];
+        let calendar = &second[0]["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(weather["index"], 0);
+        assert_eq!(calendar["index"], 1);
+        assert_ne!(weather["id"], calendar["id"]);
+        assert_eq!(first[0]["id"], second[0]["id"]);
+        assert_eq!(first[0]["id"], "resp-s");
+    }
+
+    #[tokio::test]
+    async fn sse_google_function_call_id_survives_across_frames() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
+        let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
+        let req = make_request(Method::POST, "/v1/chat/completions");
+        let mut ctx = make_filter_context(&req);
+        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
+        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
+        ctx.current_filter_id = Some(0);
+
+        let mut body = Some(Bytes::from_static(
+            b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"fc-keep\",\"name\":\"search\"}}]}}]}\n\n",
+        ));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let first = parse_sse_json_payloads(std::str::from_utf8(body.as_ref().unwrap()).unwrap());
+
+        let mut body = Some(Bytes::from_static(
+            b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"fc-keep\",\"args\":{\"q\":\"hi\"}}}]}}]}\n\n",
+        ));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let second = parse_sse_json_payloads(std::str::from_utf8(body.as_ref().unwrap()).unwrap());
+
+        assert_eq!(first[0]["choices"][0]["delta"]["tool_calls"][0]["id"], "fc-keep");
+        assert_eq!(first[0]["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
+        assert_eq!(second[0]["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
+        assert!(second[0]["choices"][0]["delta"]["tool_calls"][0].get("id").is_none());
+        assert_eq!(
+            second[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            r#"{"q":"hi"}"#
+        );
+    }
+
+    // --- SSE error propagation ---
+
+    #[tokio::test]
+    async fn sse_parse_error_emits_error_frame_before_done() {
+        // Use a tiny max_body_bytes so the SSE parser actually hits
+        // BufferOverflow — the default (1 MiB) would never overflow
+        // on a small test payload.
+        let yaml: serde_yaml::Value = serde_yaml::from_str("project: p\nmax_body_bytes: 64").unwrap();
+        let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
+        let req = make_request(Method::POST, "/v1/chat/completions");
+        let mut ctx = make_filter_context(&req);
+        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
+        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
+        ctx.current_filter_id = Some(0);
+
+        // 100 bytes exceeds the 64-byte parser buffer → BufferOverflow.
+        let overflow = "x".repeat(100);
+        let huge_frame = format!("data: {overflow}\n\n");
+        let mut body = Some(Bytes::from(huge_frame));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        // Parser error was logged — no translated frames emitted this chunk.
+        let output = std::str::from_utf8(body.as_ref().unwrap()).unwrap();
+        assert!(
+            !output.contains("chat.completion.chunk"),
+            "broken frame should not be translated"
+        );
+
+        // End the stream.
+        let mut body = Some(Bytes::new());
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+        let output = std::str::from_utf8(body.as_ref().unwrap()).unwrap();
+
+        assert!(
+            output.contains(r#""error"#),
+            "should emit an error frame before [DONE], got: {output}"
+        );
+        assert!(output.contains("server_error"), "error type should be server_error");
+        assert!(output.ends_with("data: [DONE]\n\n"), "must still end with [DONE]");
+    }
+
+    #[tokio::test]
+    async fn sse_translate_error_emits_error_frame_before_done() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
+        let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
+        let req = make_request(Method::POST, "/v1/chat/completions");
+        let mut ctx = make_filter_context(&req);
+        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
+        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
+        ctx.current_filter_id = Some(0);
+
+        // Valid SSE frame wrapping invalid JSON — transform_stream_chunk returns Err.
+        let mut body = Some(Bytes::from_static(b"data: not-json-at-all\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        // Close the stream.
+        let mut body = Some(Bytes::new());
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+        let output = std::str::from_utf8(body.as_ref().unwrap()).unwrap();
+
+        assert!(
+            output.contains(r#""error"#),
+            "should emit an error frame, got: {output}"
+        );
+        assert!(output.ends_with("data: [DONE]\n\n"), "must still end with [DONE]");
+    }
+
+    #[tokio::test]
+    async fn sse_incomplete_eof_emits_error_frame_before_done() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
+        let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
+        let req = make_request(Method::POST, "/v1/chat/completions");
+        let mut ctx = make_filter_context(&req);
+        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
+        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
+        ctx.current_filter_id = Some(0);
+
+        // Send a partial SSE frame (no blank-line terminator).
+        let mut body = Some(Bytes::from_static(
+            b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}]}}]}",
+        ));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        // End the stream — parser still has bytes in its line buffer.
+        let mut body = Some(Bytes::new());
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+        let output = std::str::from_utf8(body.as_ref().unwrap()).unwrap();
+
+        assert!(
+            output.contains(r#""error"#),
+            "incomplete frame at EOF should produce an error frame, got: {output}"
+        );
+        assert!(output.ends_with("data: [DONE]\n\n"), "must still end with [DONE]");
+    }
+
+    #[tokio::test]
+    async fn sse_clean_stream_has_no_error_frame() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
+        let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
+        let req = make_request(Method::POST, "/v1/chat/completions");
+        let mut ctx = make_filter_context(&req);
+        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
+        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
+        ctx.current_filter_id = Some(0);
+
+        let sse_data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}],\"role\":\"model\"},\"finishReason\":\"STOP\"}]}\n\n";
+        let mut body = Some(Bytes::from(sse_data.to_vec()));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        // Close the stream cleanly.
+        let mut body = Some(Bytes::new());
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+        let output = std::str::from_utf8(body.as_ref().unwrap()).unwrap();
+
+        assert!(
+            !output.contains(r#""error"#),
+            "clean stream should not contain an error frame, got: {output}"
+        );
+        assert_eq!(output, "data: [DONE]\n\n", "clean EOF should be exactly [DONE]");
+    }
+
+    #[tokio::test]
+    async fn sse_error_after_valid_frames_preserves_good_data() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
+        let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
+        let req = make_request(Method::POST, "/v1/chat/completions");
+        let mut ctx = make_filter_context(&req);
+        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
+        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
+        ctx.current_filter_id = Some(0);
+
+        // First chunk: valid frame.
+        let sse_data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}],\"role\":\"model\"},\"finishReason\":\"STOP\"}]}\n\n";
+        let mut body = Some(Bytes::from(sse_data.to_vec()));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let first_output = std::str::from_utf8(body.as_ref().unwrap()).unwrap();
+        assert!(
+            first_output.contains("chat.completion.chunk"),
+            "valid frame should translate"
+        );
+
+        // Second chunk: Vertex error frame (quota exceeded mid-stream).
+        let mut body = Some(Bytes::from_static(
+            b"data: {\"error\":{\"code\":429,\"message\":\"Quota exceeded\",\"status\":\"RESOURCE_EXHAUSTED\"}}\n\n",
+        ));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        // Close the stream.
+        let mut body = Some(Bytes::new());
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+        let output = std::str::from_utf8(body.as_ref().unwrap()).unwrap();
+
+        assert!(
+            output.contains(r#""error"#),
+            "stream with a Vertex error should end with an error frame, got: {output}"
+        );
+        assert!(output.ends_with("data: [DONE]\n\n"), "must still end with [DONE]");
+    }
+
+    #[tokio::test]
+    async fn sse_prompt_blocked_emits_error_frame_before_done() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
+        let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
+        let req = make_request(Method::POST, "/v1/chat/completions");
+        let mut ctx = make_filter_context(&req);
+        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
+        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
+        ctx.current_filter_id = Some(0);
+
+        // Vertex sends promptFeedback with no candidates when the prompt is blocked.
+        let mut body = Some(Bytes::from_static(
+            b"data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\",\"blockReasonMessage\":\"prompt violates policy\"}}\n\n",
+        ));
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+        let output = std::str::from_utf8(body.as_ref().unwrap()).unwrap();
+
+        assert!(
+            output.contains(r#""error"#),
+            "prompt block should produce an error frame, got: {output}"
+        );
+        assert!(output.contains("server_error"), "error type should be server_error");
+        assert!(output.ends_with("data: [DONE]\n\n"), "must still end with [DONE]");
     }
 
     // --- prepare_response_headers ---
