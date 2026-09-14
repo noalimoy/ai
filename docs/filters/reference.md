@@ -22,6 +22,12 @@ see the [Praxis core filter reference][core-ref].
 | [`anthropic_validate`](anthropic_validate.md) | Validates Anthropic Messages request bodies for proxy-owned JSON envelope requirements. |
 | [`anthropic_web_search`](anthropic_web_search.md) | Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop. |
 
+### Azure
+
+| Filter | Description |
+|--------|-------------|
+| [`openai_chat_completions_to_azureai_chat_completions`](openai_chat_completions_to_azureai_chat_completions.md) | Transforms requests targeting Azure OpenAI deployments into standard Chat Completions-compatible form and normalizes responses back. |
+
 ### OpenAI
 
 | Filter | Description |
@@ -30,7 +36,7 @@ see the [Praxis core filter reference][core-ref].
 | [`openai_conversations`](openai_conversations.md) | Handles all `/v1/conversations` endpoints locally. |
 | [`openai_doc_extract`](openai_doc_extract.md) | Converts `input_file` content parts to `input_text` for backends that do not support `input_file` natively (e.g. vLLM, llm-d). |
 | [`openai_file_resolve`](openai_file_resolve.md) | Resolves `file_id` and `file_url` references in Responses API input by fetching content from a Files API or remote URL via `ApiClient` and inlining the base64-encoded content in the provider-native field. |
-| [`openai_file_search_callout`](openai_file_search_callout.md) | Executes pending file search calls against a vector store API compatible backend. |
+| [`openai_file_search_callout`](openai_file_search_callout.md) | Dispatches the loop owner's pending file-search assignments against a vector store API compatible backend. |
 | [`openai_mcp_dispatch`](openai_mcp_dispatch.md) | Executes MCP tool calls against upstream MCP servers within the Responses API agentic loop. |
 | [`openai_mcp_tool_resolve`](openai_mcp_tool_resolve.md) | Resolves MCP tool entries from the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server. |
 | [`openai_response_store`](openai_response_store.md) | Persists Responses API responses to the configured response store backend. |
@@ -40,7 +46,7 @@ see the [Praxis core filter reference][core-ref].
 | [`openai_responses_proxy`](openai_responses_proxy.md) | Rebuilds the request body from `ResponsesState` when present. |
 | [`openai_responses_rehydrate`](openai_responses_rehydrate.md) | Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history (stored turns + current input). |
 | [`openai_responses_validate`](openai_responses_validate.md) | Validates and enriches Responses API requests. |
-| [`openai_stream_events`](openai_stream_events.md) | Accumulates state from native Responses API SSE event streams. |
+| [`openai_stream_events`](openai_stream_events.md) | Composes the current IRR execution into one logical Responses stream. |
 | [`openai_tool_parse`](openai_tool_parse.md) | Parses tool definitions and `tool_choice` from Responses API request bodies and promotes routing facts to metadata and filter results without mutating the body. |
 | [`openai_web_search`](openai_web_search.md) | Web search filter for model-driven `web_search_call` dispatch. |
 | [`responses_to_chat_completions`](responses_to_chat_completions.md) | Translates canonical Responses create requests for a Chat Completions backend. |
@@ -89,6 +95,12 @@ see the [Praxis core filter reference][core-ref].
 | Filter | Description |
 |--------|-------------|
 | [`ai_guardrails`](ai_guardrails.md) | Calls an external AI guardrail provider to evaluate request and response bodies. The provider determines whether content should be passed, blocked, or redacted. |
+
+### Identity Guard
+
+| Filter | Description |
+|--------|-------------|
+| [`identity_header_guard`](identity_header_guard.md) | Captures request headers matching a configured prefix into `filter_metadata` and removes them from the upstream request. |
 
 ### Inference
 

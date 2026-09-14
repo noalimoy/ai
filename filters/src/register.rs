@@ -15,9 +15,9 @@ use crate::HttpCalloutFilter;
 #[cfg(feature = "token-rate-limit-filter")]
 use crate::TokenRateLimitFilter;
 use crate::{
-    A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, ExternalMeteringFilter, IntelligentRouteFilter, McpFilter,
-    ModelToHeaderFilter, PromptEnrichFilter, ProviderRouteFilter, Sigv4SignFilter, TimeToFirstTokenFilter,
-    TokenCountFilter, TokenUsageHeadersFilter,
+    A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, ExternalMeteringFilter, IdentityHeaderGuardFilter,
+    IntelligentRouteFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter, ProviderRouteFilter, Sigv4SignFilter,
+    TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -42,6 +42,7 @@ pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
     register_aws_filters(registry);
     #[cfg(feature = "azure-ad-filter")]
     register_azure_filters(registry);
+    register_azure_translation_filters(registry);
     #[cfg(feature = "gcp-adc-filter")]
     register_gcp_filters(registry);
     register_general_ai_filters(registry);
@@ -95,6 +96,14 @@ fn register_azure_filters(registry: &mut FilterRegistry) {
     register_routing_security_filter(registry, "azure_ad", AzureAdFilter::from_config);
 }
 
+/// Register Azure OpenAI translation filters.
+fn register_azure_translation_filters(registry: &mut FilterRegistry) {
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_chat_completions_to_azureai_chat_completions" => praxis_ai_apis::azure::ChatCompletionsToAzureaiChatCompletionsFilter::from_config
+    );
+}
+
 /// Register GCP-specific filters.
 #[cfg(feature = "gcp-adc-filter")]
 fn register_gcp_filters(registry: &mut FilterRegistry) {
@@ -107,6 +116,10 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "http_callout" => HttpCalloutFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "identity_header_guard" => IdentityHeaderGuardFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
@@ -454,6 +467,7 @@ mod tests {
         let names = registry.available_filters();
         let expected = [
             "ai_guardrails",
+            "identity_header_guard",
             "openai_responses_validate",
             "responses_to_chat_completions",
             "a2a",
@@ -465,6 +479,7 @@ mod tests {
             "request_id",
             "aws_sigv4_sign",
             "openai_chat_completions_to_vertexai_gemini",
+            "openai_chat_completions_to_azureai_chat_completions",
         ];
         for name in expected {
             assert!(names.contains(&name), "expected {name} in registry");

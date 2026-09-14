@@ -82,6 +82,23 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 /// `response.failed` event. Local policy failures such as SSRF blocking
 /// remain HTTP error responses.
 ///
+/// On successful discovery, one `mcp_list_tools` output item per resolved server
+/// (in request order, including servers that resolve to zero tools) is seeded into
+/// `ResponsesState` for a downstream response-finalizing filter to surface: a
+/// buffered finalizer (`openai_agentic_loop` or `openai_mcp_dispatch`) lists it in
+/// `output`, and `openai_stream_events`, when placed inside the agentic loop on the
+/// streaming path, synthesizes its
+/// `output_item.added` → `mcp_list_tools.in_progress` → `mcp_list_tools.completed`
+/// → `output_item.done` lifecycle ahead of the model output. Unlike the failure
+/// lifecycle above — which
+/// this filter emits itself as a terminal SSE — a successful discovery must still
+/// proceed to inference, so it cannot be surfaced without one of those downstream
+/// filters; the minimal `mcp-tool-resolve.yaml` example therefore demonstrates
+/// resolution and the failure lifecycle only (see `agentic-loop.yaml` for a
+/// pipeline that surfaces successful listings). A previous-response cache hit
+/// surfaces the same item without re-calling `tools/list`, and internal retries
+/// reuse the item and its id rather than emitting a second discovery.
+///
 /// # YAML
 ///
 /// ```yaml
@@ -177,6 +194,7 @@ impl McpToolResolveFilter {
             per_entry,
             tool_map,
             resolved_labels,
+            listings,
             ..
         } = resolution;
         let Some(serialized) = rewrite_request_body(&original_bytes, per_entry, &tool_map, &resolved_labels)? else {
@@ -187,6 +205,7 @@ impl McpToolResolveFilter {
 
         let body_for_state = body.as_ref().map_or_else(|| original_bytes.as_ref(), |b| b.as_ref());
         write_state(ctx, body_for_state, tool_map);
+        commit_discovery_items(ctx, listings);
         Ok(FilterAction::Continue)
     }
 
@@ -433,6 +452,25 @@ struct Resolution {
     has_resolved: bool,
     /// Labels of entries that were resolved (including those that produced zero tools).
     resolved_labels: HashSet<String>,
+    /// One successful `mcp_list_tools` discovery listing per resolved server, in
+    /// request order (including servers that resolved to zero tools). Committed to
+    /// `ResponsesState.accumulated_output` as locally generated output items so the
+    /// successful discovery lifecycle surfaces to the client (issue #1022).
+    listings: Vec<McpListing>,
+}
+
+/// A successful local MCP discovery listing awaiting commit as an
+/// `mcp_list_tools` output item.
+///
+/// Carries only the fields the output item needs; the item `id` is assigned at
+/// commit time from the request's id generator so it matches the failure path's
+/// `mcpl_` convention.
+struct McpListing {
+    /// The MCP server's client-visible label.
+    server_label: String,
+    /// The resolved tools normalized to the `MCPListToolsTool` shape
+    /// (`name`, `input_schema`, optional `description`/`annotations`).
+    tools: Vec<serde_json::Value>,
 }
 
 // -----------------------------------------------------------------------------
@@ -465,10 +503,17 @@ fn collect_resolutions(
     let mut per_entry = Vec::with_capacity(entries.len());
     let mut has_resolved = false;
     let mut resolved_labels = HashSet::new();
+    let mut listings = Vec::new();
     for (entry, task_idx) in entries.iter().zip(entry_to_task) {
-        if let Some(resolution) = build_entry_resolution(entry, *task_idx, task_results, &mut tool_map) {
+        if let Some((resolution, listing_tools)) = build_entry_resolution(entry, *task_idx, task_results, &mut tool_map)
+        {
             has_resolved = true;
-            resolved_labels.insert(server_label(entry).to_owned());
+            let label = server_label(entry).to_owned();
+            resolved_labels.insert(label.clone());
+            listings.push(McpListing {
+                server_label: label,
+                tools: listing_tools,
+            });
             per_entry.push(resolution);
         } else {
             per_entry.push(EntryResolution::PassThrough);
@@ -479,6 +524,7 @@ fn collect_resolutions(
         tool_map,
         has_resolved,
         resolved_labels,
+        listings,
     }
 }
 
@@ -542,12 +588,18 @@ fn validate_connector_entry(entry: &serde_json::Value, connector_id: &str) -> Re
 }
 
 /// Build resolution for a single entry given task results.
+///
+/// Returns both the body-rewrite [`EntryResolution`] (the function tools that
+/// replace the `type: "mcp"` entry) and the discovery listing (the same tools in
+/// the `MCPListToolsTool` shape) that becomes the successful `mcp_list_tools`
+/// output item (issue #1022). Both are derived from the same filtered `tools/list`
+/// result before it is consumed into `tool_map`.
 fn build_entry_resolution(
     entry: &serde_json::Value,
     task_idx: Option<usize>,
     task_results: &[Option<Vec<serde_json::Value>>],
     tool_map: &mut HashMap<(String, String), serde_json::Value>,
-) -> Option<EntryResolution> {
+) -> Option<(EntryResolution, Vec<serde_json::Value>)> {
     let tools = task_idx.and_then(|idx| task_results.get(idx)?.clone())?;
     let allowed = extract_allowed_tools(entry);
     let filtered = apply_allowed_tools_filter(tools, &allowed);
@@ -556,8 +608,9 @@ fn build_entry_resolution(
         .iter()
         .map(|def| mcp_tool_to_function_tool(label, def))
         .collect();
+    let listing_tools: Vec<serde_json::Value> = filtered.iter().map(mcp_tool_to_list_tools_entry).collect();
     insert_tools(filtered, entry, tool_map);
-    Some(EntryResolution::Resolved(function_tools))
+    Some((EntryResolution::Resolved(function_tools), listing_tools))
 }
 
 /// Replace a [`ResolveError::Client`] with [`ResolveError::ConnectorClient`]
@@ -628,7 +681,7 @@ fn resolve_error_action(
         });
         return FilterAction::Continue;
     }
-    FilterAction::Reject(responses_error_rejection(status, error_type, &msg, streaming))
+    FilterAction::Reject(responses_error_rejection(status, error_type, &msg))
 }
 
 /// Compact descriptor of a deferred streaming `tools/list` runtime failure.
@@ -686,6 +739,7 @@ fn is_mcp_listing_runtime_failure(err: &ResolveError) -> bool {
             | mcp_client::McpClientError::Timeout { .. }
             | mcp_client::McpClientError::Serialization(_)
             | mcp_client::McpClientError::TooManyTools { .. }
+            | mcp_client::McpClientError::ListingTooLarge { .. }
     )
 }
 
@@ -1132,7 +1186,8 @@ fn resolvable_server_url(entry: &serde_json::Value) -> Option<&str> {
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
     {
-        debug!(server_url, "skipping deferred MCP entry");
+        let display_url = mcp_client::parse_display_url(server_url);
+        debug!(url = %display_url, "skipping deferred MCP entry");
         return None;
     }
     Some(server_url)
@@ -1238,7 +1293,8 @@ async fn fetch_tools(
     max_tools: usize,
     allow_loopback: bool,
 ) -> Result<Vec<serde_json::Value>, ResolveError> {
-    debug!(server_url, "calling MCP tools/list");
+    let display_url = mcp_client::parse_display_url(server_url);
+    debug!(url = %display_url, "calling MCP tools/list");
     let auth = entry.get("authorization").and_then(serde_json::Value::as_str);
     mcp_client::list_tools(
         server_url,
@@ -1593,6 +1649,16 @@ fn mcp_tool_to_function_tool(label: &str, definition: &serde_json::Value) -> ser
     let encoded_name = encode_function_name(label, tool_name);
 
     let description = definition.get("description").cloned();
+    // Carry the MCP `inputSchema` into `parameters` verbatim, accepting both
+    // the camelCase spelling from a fresh `tools/list` and the snake_case
+    // `input_schema` spelling stored in a cached `mcp_list_tools` listing so
+    // both provenances rewrite identically.
+    //
+    // The Responses function-tool format has slots only for
+    // `type`/`name`/`description`/`parameters`; an MCP `outputSchema` has no
+    // representation here and is intentionally dropped rather than silently
+    // lost downstream. The model still receives the tool's actual result
+    // content at dispatch time, so the output contract is unaffected.
     let parameters = definition
         .get("inputSchema")
         .or_else(|| definition.get("input_schema"))
@@ -1607,6 +1673,40 @@ fn mcp_tool_to_function_tool(label: &str, definition: &serde_json::Value) -> ser
     }
     obj.insert("parameters".to_owned(), parameters);
 
+    serde_json::Value::Object(obj)
+}
+
+/// Convert a single MCP tool definition into the `MCPListToolsTool` shape used in
+/// a successful `mcp_list_tools` output item (issue #1022).
+///
+/// The required `name` and `input_schema` are always present: `input_schema`
+/// accepts both the camelCase `inputSchema` from a fresh `tools/list` and the
+/// `snake_case` `input_schema` of a cached listing (so a previous-response cache
+/// hit round-trips identically), defaulting to `{"type": "object"}` when absent so the
+/// emitted item stays schema-valid. Optional `description` and `annotations` are
+/// carried through only when present. Unlike [`mcp_tool_to_function_tool`], no name
+/// encoding is applied: a discovery listing reports each tool under its real MCP
+/// name, and `outputSchema` remains omitted (the item shape has no slot for it).
+fn mcp_tool_to_list_tools_entry(definition: &serde_json::Value) -> serde_json::Value {
+    let name = definition
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let input_schema = definition
+        .get("inputSchema")
+        .or_else(|| definition.get("input_schema"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("name".to_owned(), serde_json::json!(name));
+    obj.insert("input_schema".to_owned(), input_schema);
+    if let Some(description) = definition.get("description") {
+        obj.insert("description".to_owned(), description.clone());
+    }
+    if let Some(annotations) = definition.get("annotations") {
+        obj.insert("annotations".to_owned(), annotations.clone());
+    }
     serde_json::Value::Object(obj)
 }
 
@@ -1641,6 +1741,64 @@ pub(crate) fn encode_function_name(label: &str, tool_name: &str) -> String {
     }
 }
 
+/// Reverse lookup for model-facing MCP function names.
+///
+/// Building this once per filter phase avoids repeatedly encoding every
+/// resolved `(server_label, tool_name)` pair for each model-emitted call.
+/// Lossy name collisions remain explicit so dispatch can fail closed.
+pub(crate) struct McpToolIndex<'a> {
+    /// Encoded function names mapped to their unique entry or collision count.
+    entries: HashMap<String, McpToolMatch<'a>>,
+}
+
+/// Resolution state for one encoded MCP function name.
+#[derive(Clone, Copy)]
+pub(crate) enum McpToolMatch<'a> {
+    /// Exactly one resolved MCP tool owns the encoded name.
+    Unique {
+        /// Original `(server_label, tool_name)` key.
+        key: &'a (String, String),
+        /// Resolved dispatch metadata.
+        entry: &'a serde_json::Value,
+    },
+    /// Multiple tools collapsed to the same lossy encoded name.
+    Ambiguous {
+        /// Number of colliding tools.
+        count: usize,
+    },
+}
+
+impl<'a> McpToolIndex<'a> {
+    /// Build a reverse index for one resolved MCP tool map.
+    pub(crate) fn new(tool_map: &'a HashMap<(String, String), serde_json::Value>) -> Self {
+        let mut entries = HashMap::with_capacity(tool_map.len());
+        for (key @ (label, tool_name), entry) in tool_map {
+            let encoded_name = encode_function_name(label, tool_name);
+            entries
+                .entry(encoded_name)
+                .and_modify(|existing| {
+                    let count = match existing {
+                        McpToolMatch::Unique { .. } => 2,
+                        McpToolMatch::Ambiguous { count } => count.saturating_add(1),
+                    };
+                    *existing = McpToolMatch::Ambiguous { count };
+                })
+                .or_insert(McpToolMatch::Unique { key, entry });
+        }
+        Self { entries }
+    }
+
+    /// Return whether any resolved MCP tool owns `encoded_name`.
+    pub(crate) fn contains(&self, encoded_name: &str) -> bool {
+        self.entries.contains_key(encoded_name)
+    }
+
+    /// Return the unique entry or collision state for `encoded_name`.
+    pub(crate) fn get(&self, encoded_name: &str) -> Option<McpToolMatch<'a>> {
+        self.entries.get(encoded_name).copied()
+    }
+}
+
 /// Write the resolved tool map and rewritten body to
 /// `ResponsesState`, creating the state from the body if none
 /// exists yet.
@@ -1672,6 +1830,74 @@ fn write_state(ctx: &mut HttpFilterContext<'_>, body: &[u8], map: HashMap<(Strin
         state.mcp_tool_map = map;
         ctx.extensions.insert(state);
     }
+}
+
+/// Commit successful discovery listings as locally generated `mcp_list_tools`
+/// output items (issue #1022).
+///
+/// One item per resolved server is appended to `ResponsesState.accumulated_output`
+/// in request order, each with a fresh `mcpl_` id and recorded in
+/// `locally_executed_output_items` so `openai_stream_events` synthesizes its
+/// `output_item.added` → `mcp_list_tools.in_progress` → `mcp_list_tools.completed`
+/// → `output_item.done` lifecycle ahead of the model output, and so the buffered
+/// path surfaces the same items through `finalize_response_body`. The whole batch
+/// is committed here only after the concurrent discovery succeeded (a failed
+/// `tools/list` aborts resolution before this point), so success items are never
+/// partially published.
+///
+/// Committing appends after any items already present (e.g. an `mcp_call` seeded by
+/// an approval resume) and is guarded against duplicating a server already listed,
+/// so an internal retry that re-runs resolution reuses the existing item and id
+/// rather than emitting a second discovery for the same server.
+fn commit_discovery_items(ctx: &mut HttpFilterContext<'_>, listings: Vec<McpListing>) {
+    if listings.is_empty() {
+        return;
+    }
+    // Assign ids up front (borrowing `id_generator`/`time_source`) so the mutable
+    // `ResponsesState` borrow below never overlaps the id-generator borrow.
+    let items: Vec<serde_json::Value> = listings
+        .into_iter()
+        .map(|listing| build_discovery_item(ctx, listing))
+        .collect();
+
+    let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
+        return;
+    };
+    for item in items {
+        append_discovery_item(state, item);
+    }
+}
+
+/// Build one `mcp_list_tools` output item with a fresh `mcpl_` id (issue #1022).
+fn build_discovery_item(ctx: &HttpFilterContext<'_>, listing: McpListing) -> serde_json::Value {
+    let McpListing { server_label, tools } = listing;
+    let id = format!("mcpl_{}", ctx.id_generator.generate(ctx.time_source));
+    serde_json::json!({
+        "id": id,
+        "type": "mcp_list_tools",
+        "server_label": server_label,
+        "tools": tools,
+        "error": null,
+    })
+}
+
+/// Append a discovery item unless its server is already listed, recording the id
+/// in `locally_executed_output_items` so the item's lifecycle is synthesized. The
+/// dedup keeps an internal retry that re-runs resolution from emitting a second
+/// discovery for the same server (issue #1022).
+fn append_discovery_item(state: &mut ResponsesState, item: serde_json::Value) {
+    let server_label = item.get("server_label").and_then(serde_json::Value::as_str);
+    let already_listed = state.accumulated_output.iter().any(|existing| {
+        existing.get("type").and_then(serde_json::Value::as_str) == Some("mcp_list_tools")
+            && existing.get("server_label").and_then(serde_json::Value::as_str) == server_label
+    });
+    if already_listed {
+        return;
+    }
+    if let Some(id) = item.get("id").and_then(serde_json::Value::as_str) {
+        state.locally_executed_output_items.insert(id.to_owned());
+    }
+    state.accumulated_output.push(item);
 }
 
 /// Check whether `openai_tool_parse` detected MCP tools.
