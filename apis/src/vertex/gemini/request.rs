@@ -7,8 +7,6 @@
 //! parameter nesting under `generationConfig`, tool definitions, and
 //! `stream` flag extraction for URL path selection.
 
-use std::collections::HashMap;
-
 use serde_json::{Map, Value, json};
 use tracing::warn;
 
@@ -46,11 +44,7 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<TransformResult, String> 
         return Err("request body is not a JSON object".to_owned());
     };
 
-    let model = obj
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "request body must contain a \"model\" field".to_owned())?
-        .to_owned();
+    let model = extract_model(obj)?;
 
     let stream = obj.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
@@ -84,6 +78,28 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<TransformResult, String> 
     Ok(TransformResult { body, model, stream })
 }
 
+/// Extract and validate the `model` field from the request body.
+///
+/// The model name is interpolated into the Vertex AI URL path, so it must
+/// not contain characters that could produce a malformed or traversable URL.
+fn extract_model(obj: &Map<String, Value>) -> Result<String, String> {
+    let model = obj
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "request body must contain a \"model\" field".to_owned())?;
+
+    if model.contains('/')
+        || model.contains('?')
+        || model.contains('#')
+        || model.contains("..")
+        || model.bytes().any(|b| b.is_ascii_control())
+    {
+        return Err("model name contains characters unsafe for URL path interpolation".to_owned());
+    }
+
+    Ok(model.to_owned())
+}
+
 // -----------------------------------------------------------------------------
 // Message Conversion
 // -----------------------------------------------------------------------------
@@ -103,13 +119,10 @@ fn convert_messages(obj: &Map<String, Value>) -> (Vec<Value>, Option<Value>) {
         return (Vec::new(), None);
     };
 
-    // Resolve tool_call_id → function name for tool result messages.
-    let tool_name_map = build_tool_call_name_map(messages);
-
     let mut contents = Vec::new();
     let mut system_parts = Vec::new();
 
-    for msg in messages {
+    for (i, msg) in messages.iter().enumerate() {
         let Some(role) = msg.get("role").and_then(Value::as_str) else {
             continue;
         };
@@ -118,7 +131,7 @@ fn convert_messages(obj: &Map<String, Value>) -> (Vec<Value>, Option<Value>) {
             "system" | "developer" => collect_system_parts(&mut system_parts, msg),
             "user" => convert_user_message(&mut contents, msg),
             "assistant" => convert_assistant_message(&mut contents, msg),
-            "tool" | "function" => convert_tool_result(&mut contents, msg, &tool_name_map),
+            "tool" | "function" => convert_tool_result(&mut contents, messages, i, msg),
             _ => {
                 warn!(role, "dropping message with unknown role");
             },
@@ -132,36 +145,6 @@ fn convert_messages(obj: &Map<String, Value>) -> (Vec<Value>, Option<Value>) {
     };
 
     (contents, system_instruction)
-}
-
-/// Build a map from `tool_call_id` → function name by scanning assistant
-/// messages that contain `tool_calls`.
-///
-/// This is needed because OpenAI `tool` messages only carry `tool_call_id`
-/// (not `name`), but Gemini `functionResponse` requires the function name.
-fn build_tool_call_name_map(messages: &[Value]) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-
-    for msg in messages {
-        if msg.get("role").and_then(Value::as_str) != Some("assistant") {
-            continue;
-        }
-
-        let Some(Value::Array(tool_calls)) = msg.get("tool_calls") else {
-            continue;
-        };
-
-        for tc in tool_calls {
-            let id = tc.get("id").and_then(Value::as_str);
-            let name = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str);
-
-            if let (Some(id), Some(name)) = (id, name) {
-                map.insert(id.to_owned(), name.to_owned());
-            }
-        }
-    }
-
-    map
 }
 
 // -----------------------------------------------------------------------------
@@ -285,7 +268,8 @@ fn guess_mime_type(url: &str) -> &'static str {
 
 /// Convert an `assistant` role message to a Gemini `model` content entry.
 ///
-/// Handles plain text responses and tool calls (`functionCall` parts).
+/// Handles plain text, tool calls (`functionCall` parts), and any
+/// `thoughtSignature` stashed on the tool call as `extra_content`.
 fn convert_assistant_message(contents: &mut Vec<Value>, msg: &Value) {
     let mut parts = Vec::new();
 
@@ -309,6 +293,11 @@ fn convert_assistant_message(contents: &mut Vec<Value>, msg: &Value) {
 }
 
 /// Convert a single OpenAI tool call to a Gemini `functionCall` part.
+///
+/// Gemini 3 requires the previous turn's `thoughtSignature` verbatim on
+/// each `functionCall` part. Chat Completions clients carry it in
+/// `extra_content.google.thought_signature` (Google's OpenAI-compatible
+/// extension); copy it back onto the Part when present.
 fn convert_tool_call(tc: &Value) -> Option<Value> {
     let name = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str)?;
 
@@ -320,12 +309,21 @@ fn convert_tool_call(tc: &Value) -> Option<Value> {
 
     let args: Value = serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
 
-    Some(json!({
+    let mut part = json!({
         "functionCall": {
             "name": name,
             "args": args,
         }
-    }))
+    });
+
+    if let Some(sig) = tc.pointer("/extra_content/google/thought_signature")
+        && !sig.is_null()
+        && let Some(obj) = part.as_object_mut()
+    {
+        obj.insert("thoughtSignature".to_owned(), sig.clone());
+    }
+
+    Some(part)
 }
 
 // -----------------------------------------------------------------------------
@@ -338,10 +336,10 @@ fn convert_tool_call(tc: &Value) -> Option<Value> {
 /// Resolves the function name in order of preference:
 /// 1. `msg["name"]` — present on deprecated `function` messages and some clients that add it to `tool` messages for
 ///    convenience
-/// 2. `tool_call_id` → lookup in `tool_name_map` built from prior assistant `tool_calls`
+/// 2. `tool_call_id` → nearest preceding assistant `tool_calls` entry with that id
 /// 3. Fallback to `"unknown"` with a warning (Gemini will likely reject this with 400)
-fn convert_tool_result(contents: &mut Vec<Value>, msg: &Value, tool_name_map: &HashMap<String, String>) {
-    let name = resolve_tool_function_name(msg, tool_name_map);
+fn convert_tool_result(contents: &mut Vec<Value>, messages: &[Value], index: usize, msg: &Value) {
+    let name = resolve_tool_function_name(messages, index, msg);
 
     let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
 
@@ -361,32 +359,56 @@ fn convert_tool_result(contents: &mut Vec<Value>, msg: &Value, tool_name_map: &H
 /// Resolve the function name for a tool/function result message.
 ///
 /// Tries `msg["name"]` first (always present on deprecated `function`
-/// messages, sometimes present on `tool` messages). Falls back to
-/// looking up `tool_call_id` in the map built from assistant
-/// `tool_calls`. Logs a warning if neither source provides a name.
-fn resolve_tool_function_name<'a>(msg: &'a Value, tool_name_map: &'a HashMap<String, String>) -> &'a str {
-    // 1. Direct name field (deprecated `function` messages, some clients)
+/// messages, sometimes present on `tool` messages). Falls back to the
+/// nearest preceding assistant `tool_calls` entry with a matching id,
+/// so a reused id from a later round cannot steal an earlier result.
+fn resolve_tool_function_name<'a>(messages: &'a [Value], tool_index: usize, msg: &'a Value) -> &'a str {
     if let Some(name) = msg.get("name").and_then(Value::as_str)
         && !name.is_empty()
     {
         return name;
     }
 
-    // 2. Lookup via tool_call_id → assistant tool_calls
-    if let Some(tool_call_id) = msg.get("tool_call_id").and_then(Value::as_str) {
-        if let Some(name) = tool_name_map.get(tool_call_id) {
-            return name.as_str();
-        }
-        warn!(
-            tool_call_id,
-            "tool message tool_call_id has no matching assistant tool_call; \
-             using \"unknown\" as function name"
-        );
-    } else {
+    let Some(tool_call_id) = msg.get("tool_call_id").and_then(Value::as_str) else {
         warn!("tool message has neither name nor tool_call_id");
+        return "unknown";
+    };
+
+    if let Some(name) = name_from_preceding_tool_call(messages, tool_index, tool_call_id) {
+        return name;
     }
 
+    warn!(
+        tool_call_id,
+        "tool message tool_call_id has no matching assistant tool_call; \
+         using \"unknown\" as function name"
+    );
     "unknown"
+}
+
+/// Scan messages before `tool_index` for the nearest assistant `tool_calls`
+/// entry whose `id` matches `tool_call_id`.
+fn name_from_preceding_tool_call<'a>(messages: &'a [Value], tool_index: usize, tool_call_id: &str) -> Option<&'a str> {
+    let (prior, _) = messages.split_at(tool_index);
+    for earlier in prior.iter().rev() {
+        if earlier.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(Value::Array(tool_calls)) = earlier.get("tool_calls") else {
+            continue;
+        };
+        for tc in tool_calls.iter().rev() {
+            if tc.get("id").and_then(Value::as_str) != Some(tool_call_id) {
+                continue;
+            }
+            if let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str)
+                && !name.is_empty()
+            {
+                return Some(name);
+            }
+        }
+    }
+    None
 }
 
 // -----------------------------------------------------------------------------
@@ -734,6 +756,31 @@ mod tests {
     }
 
     #[test]
+    fn colliding_tool_call_ids_resolve_to_nearest_preceding_name() {
+        // A history-wide HashMap last-wins would bind both results to get_calendar.
+        let body = br#"{"model":"gemini-1.5-pro","messages":[
+            {"role":"user","content":"weather then calendar"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_vertex_0","type":"function","function":{"name":"get_weather","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"call_vertex_0","content":"{\"temp\":72}"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_vertex_0","type":"function","function":{"name":"get_calendar","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"call_vertex_0","content":"{\"event\":\"standup\"}"}
+        ]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
+
+        let weather = &parsed["contents"][2]["parts"][0]["functionResponse"];
+        let calendar = &parsed["contents"][4]["parts"][0]["functionResponse"];
+        assert_eq!(weather["name"], "get_weather");
+        assert_eq!(weather["response"]["temp"], 72);
+        assert_eq!(calendar["name"], "get_calendar");
+        assert_eq!(calendar["response"]["event"], "standup");
+    }
+
+    #[test]
     fn tool_result_unresolvable_falls_back_to_unknown() {
         // No name, no matching tool_call_id in history → "unknown"
         let body = br#"{"model":"gemini-1.5-pro","messages":[
@@ -805,6 +852,69 @@ mod tests {
         assert_eq!(parsed["contents"][0]["role"], "model");
         assert_eq!(part["functionCall"]["name"], "get_weather");
         assert_eq!(part["functionCall"]["args"]["city"], "NYC");
+        assert!(
+            part["functionCall"].get("id").is_none(),
+            "Vertex native REST rejects functionCall.id; OpenAI tool_calls[].id stays client-side"
+        );
+    }
+
+    #[test]
+    fn assistant_tool_call_thought_signature_round_trips() {
+        let body = br#"{"model":"gemini-1.5-pro","messages":[
+            {"role":"assistant","content":null,"tool_calls":[
+                {
+                    "id":"call_1",
+                    "type":"function",
+                    "function":{"name":"get_weather","arguments":"{\"city\":\"NYC\"}"},
+                    "extra_content":{"google":{"thought_signature":"sig-abc"}}
+                }
+            ]}
+        ]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
+        let part = &parsed["contents"][0]["parts"][0];
+
+        assert_eq!(part["thoughtSignature"], "sig-abc");
+        assert_eq!(part["functionCall"]["name"], "get_weather");
+        assert!(
+            part["functionCall"].get("thoughtSignature").is_none(),
+            "signature belongs on the Part, not inside functionCall"
+        );
+        assert!(
+            part["functionCall"].get("id").is_none(),
+            "do not echo OpenAI/Google call ids on Vertex native functionCall"
+        );
+    }
+
+    #[test]
+    fn assistant_tool_call_google_id_not_sent_on_function_call() {
+        let body = br#"{"model":"gemini-1.5-pro","messages":[
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"adk-call-123","type":"function","function":{"name":"get_weather","arguments":"{}"}}
+            ]}
+        ]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
+        let part = &parsed["contents"][0]["parts"][0];
+
+        assert_eq!(part["functionCall"]["name"], "get_weather");
+        assert!(part["functionCall"].get("id").is_none());
+    }
+
+    #[test]
+    fn tool_result_does_not_send_function_response_id() {
+        let body = br#"{"model":"gemini-1.5-pro","messages":[
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"adk-call-123","type":"function","function":{"name":"get_weather","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"adk-call-123","content":"{\"temp\":72}"}
+        ]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
+        let fr = &parsed["contents"][1]["parts"][0]["functionResponse"];
+
+        assert_eq!(fr["name"], "get_weather");
+        assert!(fr.get("id").is_none());
     }
 
     #[test]
@@ -1015,6 +1125,13 @@ mod tests {
             parsed.get("systemInstruction").is_none(),
             "empty system content should be omitted"
         );
+    }
+
+    #[test]
+    fn model_with_path_traversal_rejected() {
+        let body = br#"{"model":"../../other-model","messages":[{"role":"user","content":"Hi"}]}"#;
+        let err = transform_request(body).unwrap_err();
+        assert!(err.contains("unsafe"), "{err}");
     }
 
     #[test]
