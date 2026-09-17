@@ -27,6 +27,7 @@ Usage:
 
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -100,12 +101,19 @@ class FakeVertexGeminiHandler(BaseHTTPRequestHandler):
     - POST /v1/projects/{project}/locations/{region}/models/{model}:generateContent
     - POST /v1/projects/{project}/locations/{region}/models/{model}:streamGenerateContent?alt=sse
 
-    The model name, project, and region are hardcoded fixtures and not validated.
-    Real request bodies are parsed to extract messages and tools for response synthesis.
+    Paths and the translated request shape are validated so an SDK test cannot
+    pass by accidentally reaching an un-translated endpoint.
     """
 
     # Shared request capture for test assertions
     last_request_body: Optional[bytes] = None
+    last_request_path: Optional[str] = None
+
+    VERTEX_PATH = re.compile(
+        r"^/v1/projects/test-project/locations/us-central1/"
+        r"publishers/google/models/(?P<model>[A-Za-z0-9._-]+)"
+        r"(?P<method>:(?:generateContent|streamGenerateContent))(?P<query>\?alt=sse)?$"
+    )
 
     def do_POST(self) -> None:
         """Handle POST request to generateContent or streamGenerateContent endpoints."""
@@ -113,6 +121,7 @@ class FakeVertexGeminiHandler(BaseHTTPRequestHandler):
             content_length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_length)
             FakeVertexGeminiHandler.last_request_body = body
+            FakeVertexGeminiHandler.last_request_path = self.path
 
             # Parse the request to determine response
             try:
@@ -121,13 +130,28 @@ class FakeVertexGeminiHandler(BaseHTTPRequestHandler):
                 self._send_error(400, "Invalid JSON in request body")
                 return
 
-            # Route based on endpoint
-            if self.path.endswith(":streamGenerateContent?alt=sse"):
+            path_match = self.VERTEX_PATH.fullmatch(self.path)
+            if path_match is None:
+                self._send_error(404, f"Unexpected Vertex path: {self.path}")
+                return
+
+            if not isinstance(request_json.get("contents"), list):
+                self._send_error(400, "Translated request must contain contents")
+                return
+            if "messages" in request_json or "model" in request_json or "stream" in request_json:
+                self._send_error(400, "OpenAI-only fields reached the Vertex backend")
+                return
+
+            # Route based on the exact Vertex endpoint.
+            if path_match.group("method") == ":streamGenerateContent":
+                if path_match.group("query") != "?alt=sse":
+                    self._send_error(404, "Streaming endpoint must request SSE")
+                    return
                 self._handle_streaming(request_json)
-            elif self.path.endswith(":generateContent"):
+            elif path_match.group("query") is None:
                 self._handle_non_streaming(request_json)
             else:
-                self._send_error(404, "Unknown Vertex endpoint")
+                self._send_error(404, "Non-streaming endpoint must not have a query")
         except Exception as e:
             self._send_error(500, f"Server error: {e}")
 
@@ -136,14 +160,17 @@ class FakeVertexGeminiHandler(BaseHTTPRequestHandler):
         # Extract user message from OpenAI-translated Gemini format
         contents = request_json.get("contents", [])
         user_text = ""
-        has_tool_use = "functionDeclarations" in request_json.get("tools", []) if "tools" in request_json else False
+        has_tool_use = bool(request_json.get("tools"))
 
         if contents:
             parts = contents[0].get("parts", [])
             if parts and "text" in parts[0]:
                 user_text = parts[0]["text"]
 
-        # Generate response based on request
+        if "trigger upstream error" in user_text.lower():
+            self._send_error(429, "Quota exceeded by fake Vertex backend")
+            return
+
         response = self._make_gemini_response(user_text, has_tool_use)
         self._send_json_response(200, response)
 
@@ -175,7 +202,28 @@ class FakeVertexGeminiHandler(BaseHTTPRequestHandler):
 
     def _make_gemini_response(self, user_text: str, has_tools: bool) -> dict[str, Any]:
         """Synthesize a Gemini generateContent response."""
-        response_text = self._synthesize_response(user_text, has_tools)
+        if has_tools:
+            return {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "functionCall": {
+                                        "name": "get_weather",
+                                        "args": {"location": "Paris"},
+                                    }
+                                }
+                            ],
+                            "role": "model",
+                        },
+                        "finishReason": "STOP",
+                        "index": 0,
+                    }
+                ]
+            }
+
+        response_text = self._synthesize_response(user_text, False)
 
         return {
             "candidates": [
@@ -400,6 +448,13 @@ class TestVertexGeminiChatCompletions:
         request_body = json.loads(FakeVertexGeminiHandler.last_request_body)
         assert "contents" in request_body, "Request should have 'contents' (Gemini format)"
         assert "messages" not in request_body, "Request should not have 'messages' (OpenAI format)"
+        assert request_body["contents"] == [
+            {"role": "user", "parts": [{"text": "What is 2+2?"}]}
+        ]
+        assert FakeVertexGeminiHandler.last_request_path == (
+            "/v1/projects/test-project/locations/us-central1/publishers/google/"
+            "models/gemini-2.0-flash:generateContent"
+        )
 
     def test_non_streaming_greeting(self, openai_client: OpenAI) -> None:
         """Non-streaming request handles different inputs."""
@@ -442,6 +497,83 @@ class TestVertexGeminiChatCompletions:
             if chunk.choices[0].delta.content
         )
         assert len(content) > 0, "Stream should have assembled content"
+        request_body = json.loads(FakeVertexGeminiHandler.last_request_body)
+        assert request_body["contents"] == [
+            {"role": "user", "parts": [{"text": "Say hello"}]}
+        ]
+        assert FakeVertexGeminiHandler.last_request_path == (
+            "/v1/projects/test-project/locations/us-central1/publishers/google/"
+            "models/gemini-2.0-flash:streamGenerateContent?alt=sse"
+        )
+
+    def test_tool_call(self, openai_client: OpenAI) -> None:
+        """SDK receives a tool call and the backend sees Gemini declarations."""
+        response = openai_client.chat.completions.create(
+            model="gemini-2.0-flash",
+            messages=[{"role": "user", "content": "What is the weather in Paris?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather for a location",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                            "required": ["location"],
+                        },
+                    },
+                }
+            ],
+            tool_choice="required",
+        )
+
+        assert response.choices[0].finish_reason == "tool_calls"
+        tool_call = response.choices[0].message.tool_calls[0]
+        assert tool_call.type == "function"
+        assert tool_call.function.name == "get_weather"
+        assert json.loads(tool_call.function.arguments) == {"location": "Paris"}
+
+        request_body = json.loads(FakeVertexGeminiHandler.last_request_body)
+        assert request_body["contents"] == [
+            {"role": "user", "parts": [{"text": "What is the weather in Paris?"}]}
+        ]
+        assert request_body["tools"] == [
+            {
+                "functionDeclarations": [
+                    {
+                        "name": "get_weather",
+                        "description": "Get weather for a location",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                            "required": ["location"],
+                        },
+                    }
+                ]
+            }
+        ]
+        assert request_body["toolConfig"] == {"functionCallingConfig": {"mode": "ANY"}}
+
+    def test_upstream_error(self, openai_client: OpenAI) -> None:
+        """Vertex errors retain their status and become OpenAI SDK exceptions."""
+        with pytest.raises(APIStatusError) as exc_info:
+            openai_client.chat.completions.create(
+                model="gemini-2.0-flash",
+                messages=[{"role": "user", "content": "Trigger upstream error"}],
+            )
+
+        error = exc_info.value
+        assert error.status_code == 429
+        assert error.body["message"] == "Quota exceeded by fake Vertex backend"
+        assert error.body["type"] == "server_error"
+        request_body = json.loads(FakeVertexGeminiHandler.last_request_body)
+        assert request_body["contents"] == [
+            {"role": "user", "parts": [{"text": "Trigger upstream error"}]}
+        ]
+        assert FakeVertexGeminiHandler.last_request_path.endswith(
+            "/models/gemini-2.0-flash:generateContent"
+        )
 
     def test_streaming_with_usage(self, openai_client: OpenAI) -> None:
         """Streaming response receives chunks with content and finish_reason."""
@@ -501,14 +633,15 @@ class TestVertexGeminiChatCompletions:
 
     def test_model_name_in_path(self, openai_client: OpenAI) -> None:
         """Model name from request is correctly placed in Vertex API path."""
-        # The fake backend doesn't validate the path, but the Rust integration
-        # test (vertex_gemini.rs) verifies path correctness. Here we just verify
-        # the request succeeds and gets a response, proving the path was valid.
         response = openai_client.chat.completions.create(
             model="gemini-2.0-flash",
             messages=[{"role": "user", "content": "test"}],
         )
         assert response.model == "gemini-2.0-flash"
+        assert FakeVertexGeminiHandler.last_request_path == (
+            "/v1/projects/test-project/locations/us-central1/publishers/google/"
+            "models/gemini-2.0-flash:generateContent"
+        )
 
     def test_multiple_requests_isolation(self, openai_client: OpenAI) -> None:
         """Multiple requests do not interfere with each other."""
