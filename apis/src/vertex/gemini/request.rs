@@ -24,6 +24,9 @@ pub(crate) struct TransformResult {
     pub model: String,
     /// Whether the client requested streaming (`stream: true`).
     pub stream: bool,
+    /// OpenAI `stream_options.include_usage`. Vertex has no equivalent;
+    /// the response path emits a trailing usage chunk when this is set.
+    pub include_usage: bool,
 }
 
 /// Transform an OpenAI Chat Completions request body into Vertex AI
@@ -46,7 +49,8 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<TransformResult, String> 
 
     let model = extract_model(obj)?;
 
-    let stream = obj.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let stream = extract_stream_flag(obj)?;
+    let include_usage = include_usage_requested(obj, stream);
 
     let mut gemini = Map::new();
 
@@ -75,7 +79,12 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<TransformResult, String> 
 
     let body = serde_json::to_vec(&Value::Object(gemini)).map_err(|e| format!("serialization failed: {e}"))?;
 
-    Ok(TransformResult { body, model, stream })
+    Ok(TransformResult {
+        body,
+        model,
+        stream,
+        include_usage,
+    })
 }
 
 /// Extract and validate the `model` field from the request body.
@@ -88,6 +97,10 @@ fn extract_model(obj: &Map<String, Value>) -> Result<String, String> {
         .and_then(Value::as_str)
         .ok_or_else(|| "request body must contain a \"model\" field".to_owned())?;
 
+    if model.is_empty() {
+        return Err("model name must not be empty".to_owned());
+    }
+
     if model.contains('/')
         || model.contains('?')
         || model.contains('#')
@@ -98,6 +111,36 @@ fn extract_model(obj: &Map<String, Value>) -> Result<String, String> {
     }
 
     Ok(model.to_owned())
+}
+
+/// Extract and validate the `stream` field from the request body.
+///
+/// `stream` is proxy-critical: it determines which Vertex endpoint is
+/// called and whether the response is SSE. A non-boolean value (e.g.
+/// `"stream": "true"`) silently becoming `false` would give the client
+/// a full JSON blob instead of the expected SSE stream, which is a hard
+/// to debug contract violation. Absent or `null` both mean `false` per
+/// the OpenAI specification.
+fn extract_stream_flag(obj: &Map<String, Value>) -> Result<bool, String> {
+    match obj.get("stream") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err("\"stream\" must be a boolean or null".to_owned()),
+    }
+}
+
+/// OpenAI `stream_options.include_usage` is meaningful only with `stream: true`.
+///
+/// Gemini has no equivalent flag: `usageMetadata` always arrives on the
+/// last SSE frame. The filter stashes it and emits the OpenAI usage
+/// chunk only when the client asked for it.
+fn include_usage_requested(obj: &Map<String, Value>, stream: bool) -> bool {
+    stream
+        && obj
+            .get("stream_options")
+            .and_then(|opts| opts.get("include_usage"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
 }
 
 // -----------------------------------------------------------------------------
@@ -632,6 +675,31 @@ mod tests {
     }
 
     #[test]
+    fn stream_string_true_rejected() {
+        // "stream":"true" (string) must be rejected — the client clearly
+        // intended SSE but would silently receive a JSON blob if we coerce
+        // it to false. Return a 400 so the caller can fix the request.
+        let body = br#"{"model":"gemini-1.5-flash","stream":"true","messages":[{"role":"user","content":"Hi"}]}"#;
+        let err = transform_request(body).unwrap_err();
+        assert!(err.contains("boolean"), "error should mention boolean: {err}");
+    }
+
+    #[test]
+    fn stream_number_rejected() {
+        let body = br#"{"model":"gemini-1.5-flash","stream":1,"messages":[{"role":"user","content":"Hi"}]}"#;
+        let err = transform_request(body).unwrap_err();
+        assert!(err.contains("boolean"), "error should mention boolean: {err}");
+    }
+
+    #[test]
+    fn stream_null_becomes_false() {
+        // null is explicitly allowed by the OpenAI spec and means false.
+        let body = br#"{"model":"gemini-1.5-flash","stream":null,"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        assert!(!result.stream);
+    }
+
+    #[test]
     fn missing_model_fails() {
         let body = br#"{"messages":[{"role":"user","content":"Hi"}]}"#;
         let err = transform_request(body).unwrap_err();
@@ -1135,6 +1203,16 @@ mod tests {
     }
 
     #[test]
+    fn empty_model_rejected() {
+        // An empty model name passes character validation but produces a
+        // malformed Vertex path ("/models/:generateContent"). Must be
+        // rejected with a 400 before the path is rewritten.
+        let body = br#"{"model":"","messages":[{"role":"user","content":"Hi"}]}"#;
+        let err = transform_request(body).unwrap_err();
+        assert!(err.contains("empty"), "error should mention empty: {err}");
+    }
+
+    #[test]
     fn empty_messages_array() {
         let body = br#"{"model":"gemini-1.5-pro","messages":[]}"#;
         let result = transform_request(body).unwrap();
@@ -1180,6 +1258,20 @@ mod tests {
 
         assert_eq!(parsed["generationConfig"]["presencePenalty"], 0.5);
         assert_eq!(parsed["generationConfig"]["frequencyPenalty"], 0.3);
+    }
+
+    #[test]
+    fn streaming_include_usage_is_extracted_not_forwarded() {
+        let body = br#"{"model":"gemini-2.0-flash","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
+
+        assert!(result.include_usage);
+        assert!(result.stream);
+        assert!(
+            parsed.get("stream_options").is_none(),
+            "Gemini has no stream_options; must not be forwarded"
+        );
     }
 
     #[test]
