@@ -7,9 +7,13 @@
 //! `usageMetadata` → `usage`, `finishReason` mapping, and
 //! `functionCall` parts → `tool_calls`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use serde_json::{Map, Value, json};
+use tracing::warn;
 
 // -----------------------------------------------------------------------------
 // Tool-call Slots
@@ -26,14 +30,23 @@ static TOOL_CALL_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 /// slots and the OpenAI completion `id` survive across SSE frames.
 #[derive(Debug)]
 pub(crate) struct StreamTranslateState {
-    /// Whether the next emitted chunk should include `delta.role`.
-    pub(crate) is_first_chunk: bool,
     /// Unix timestamp fixed at stream start.
     pub(crate) created: u64,
     /// OpenAI chunk `id`, locked on the first frame and never swapped.
     completion_id: Option<String>,
-    /// Tool-call slots for this stream (`index` is the vec position).
-    slots: Vec<ToolCallSlot>,
+    /// Tool-call slots per candidate (`index` is the inner vec position).
+    slots_by_candidate: BTreeMap<u64, Vec<ToolCallSlot>>,
+    /// Candidate indices that have already emitted at least one delta.
+    started_candidates: BTreeSet<u64>,
+    /// Client asked for `stream_options.include_usage`.
+    include_usage: bool,
+    /// Latest Vertex `usageMetadata`, converted to OpenAI `usage`.
+    ///
+    /// Vertex sends cumulative counts on the last frame (often together
+    /// with `finishReason`). OpenAI wants them on a *separate* trailing
+    /// chunk with `choices: []`, so this is stashed rather than emitted
+    /// inline.
+    usage: Option<Value>,
 }
 
 /// One OpenAI `tool_calls[]` entry assembled across Gemini SSE frames.
@@ -62,10 +75,31 @@ impl StreamTranslateState {
     /// Create state for a new SSE response.
     pub(crate) fn new() -> Self {
         Self {
-            is_first_chunk: true,
             created: created_timestamp(),
             completion_id: None,
-            slots: Vec::new(),
+            slots_by_candidate: BTreeMap::new(),
+            started_candidates: BTreeSet::new(),
+            include_usage: false,
+            usage: None,
+        }
+    }
+
+    /// Enable the OpenAI trailing usage chunk for this stream.
+    pub(crate) fn set_include_usage(&mut self, include_usage: bool) {
+        self.include_usage = include_usage;
+    }
+
+    /// Record Vertex `usageMetadata` from this frame. Later frames
+    /// overwrite earlier ones; Vertex counts are cumulative.
+    ///
+    /// No-op when `include_usage` is `false` — the allocation is
+    /// skipped entirely since the stash will never be read.
+    fn capture_usage(&mut self, obj: Option<&Map<String, Value>>) {
+        if !self.include_usage {
+            return;
+        }
+        if let Some(usage) = obj.and_then(|o| o.get("usageMetadata")) {
+            self.usage = Some(convert_usage(usage));
         }
     }
 
@@ -311,10 +345,17 @@ fn mint_tool_call_id() -> String {
 /// is overridden to `"tool_calls"` regardless of the Gemini value
 /// (Gemini uses `STOP` for both text and function call completions).
 ///
-/// Gemini `FinishReason` enum (full list):
+/// Gemini `FinishReason` enum (full list, as of Vertex AI REST v1):
 /// `STOP`, `MAX_TOKENS`, `SAFETY`, `RECITATION`, `LANGUAGE`, `OTHER`,
 /// `BLOCKLIST`, `PROHIBITED_CONTENT`, `SPII`, `MALFORMED_FUNCTION_CALL`,
-/// `IMAGE_SAFETY`, `FINISH_REASON_UNSPECIFIED`.
+/// `IMAGE_SAFETY`, `MODEL_ARMOR`, `FINISH_REASON_UNSPECIFIED`.
+///
+/// `MODEL_ARMOR` indicates the response was blocked by [Model Armor],
+/// Google's enterprise content-safety layer. It must map to
+/// `"content_filter"` — treating it as `"stop"` misreports a blocked
+/// response as a normal completion.
+///
+/// [Model Armor]: https://cloud.google.com/model-armor/docs/
 fn convert_finish_reason(reason: Option<&str>, has_tool_calls: bool) -> &'static str {
     if has_tool_calls {
         return "tool_calls";
@@ -324,7 +365,7 @@ fn convert_finish_reason(reason: Option<&str>, has_tool_calls: bool) -> &'static
         Some("MAX_TOKENS") => "length",
         Some(
             "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "IMAGE_SAFETY" | "LANGUAGE"
-            | "OTHER",
+            | "OTHER" | "MODEL_ARMOR",
         ) => "content_filter",
         // STOP, MALFORMED_FUNCTION_CALL, FINISH_REASON_UNSPECIFIED,
         // unknown, or absent all map to "stop".
@@ -431,64 +472,109 @@ fn token_utf8_bytes(token: &str) -> Value {
 ///
 /// `state` holds the sticky completion id and tool-call slots so a
 /// `functionCall` that arrives across frames keeps the same OpenAI `id`
-/// and `index`. Callers flip `state.is_first_chunk` after a successful
-/// translate so only the first chunk includes `delta.role`.
+/// and `index`. First-delta state is tracked per candidate so a candidate
+/// that first appears in a later frame still includes `delta.role`.
+///
+/// Returns `Ok(None)` for frames with no `candidates` that are not
+/// errors (usage-only / empty JSON). Vertex often sends `usageMetadata`
+/// on such a frame, or on the last candidate frame; it is stashed for
+/// [`take_stream_usage_chunk`].
 pub(crate) fn transform_stream_chunk(
     data: &[u8],
     model: &str,
     state: &mut StreamTranslateState,
-) -> Result<Vec<u8>, String> {
+) -> Result<Option<Vec<u8>>, String> {
     let value: Value = serde_json::from_slice(data).map_err(|e| format!("invalid JSON: {e}"))?;
     let obj = value.as_object();
 
     state.ensure_completion_id(obj.and_then(|o| o.get("responseId")).and_then(Value::as_str));
+    state.capture_usage(obj);
 
-    let candidate = obj
-        .and_then(|o| o.get("candidates"))
-        .and_then(Value::as_array)
-        .and_then(|c| c.first());
+    let candidates = obj.and_then(|o| o.get("candidates")).and_then(Value::as_array);
 
     // Detect upstream errors and content blocks that arrive as valid JSON
     // but carry no candidates. Without this check these frames silently
     // produce empty deltas that look like successful completions.
-    if candidate.is_none() {
+    if candidates.is_none_or(Vec::is_empty) {
         reject_upstream_error_frame(obj)?;
+        return Ok(None);
     }
 
-    let choice = build_stream_choice(candidate, state);
+    let choices = candidates
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(position, candidate)| build_stream_choice(candidate, position as u64, state))
+        .collect::<Vec<_>>();
 
+    let mut chunk = json!({
+        "id": state.completion_id.as_deref().unwrap_or(super::FALLBACK_RESPONSE_ID),
+        "object": "chat.completion.chunk",
+        "created": state.created,
+        "model": model,
+        "choices": choices,
+    });
+    // OpenAI: when include_usage is set, every content chunk carries
+    // `usage: null`; the populated object is a later, separate chunk.
+    if state.include_usage
+        && let Some(obj) = chunk.as_object_mut()
+    {
+        obj.insert("usage".to_owned(), Value::Null);
+    }
+
+    serde_json::to_vec(&chunk)
+        .map(Some)
+        .map_err(|e| format!("serialization failed: {e}"))
+}
+
+/// Build the trailing OpenAI usage chunk (`choices: []`) if the client
+/// asked for `include_usage` and Vertex sent `usageMetadata`.
+///
+/// Call once at `end_of_stream`, immediately before `[DONE]`. Do not
+/// call after a stream error — OpenAI omits the usage chunk when the
+/// stream is interrupted.
+pub(crate) fn take_stream_usage_chunk(state: &mut StreamTranslateState, model: &str) -> Option<Vec<u8>> {
+    if !state.include_usage {
+        return None;
+    }
+    let usage = state.usage.take()?;
     let chunk = json!({
         "id": state.completion_id.as_deref().unwrap_or(super::FALLBACK_RESPONSE_ID),
         "object": "chat.completion.chunk",
         "created": state.created,
         "model": model,
-        "choices": [choice],
+        "choices": [],
+        "usage": usage,
     });
-
-    serde_json::to_vec(&chunk).map_err(|e| format!("serialization failed: {e}"))
+    serde_json::to_vec(&chunk)
+        .map_err(|e| warn!(error = %e, "failed to serialize streaming usage chunk"))
+        .ok()
 }
 
 /// Build a single OpenAI streaming choice from a Gemini candidate.
-fn build_stream_choice(candidate: Option<&Value>, state: &mut StreamTranslateState) -> Value {
+fn build_stream_choice(candidate: &Value, default_index: u64, state: &mut StreamTranslateState) -> Value {
+    let candidate_index = candidate.get("index").and_then(Value::as_u64).unwrap_or(default_index);
     let parts = candidate
-        .and_then(|c| c.get("content"))
+        .get("content")
         .and_then(|c| c.get("parts"))
         .and_then(Value::as_array);
 
-    let finish_reason = candidate.and_then(|c| c.get("finishReason")).and_then(Value::as_str);
-    let (content, tool_calls) = extract_stream_content_and_tool_calls(parts, &mut state.slots);
-    let has_tool_calls = !tool_calls.is_empty() || !state.slots.is_empty();
-    let delta = build_stream_delta(state.is_first_chunk, content, tool_calls);
+    let finish_reason = candidate.get("finishReason").and_then(Value::as_str);
+    let is_first_delta = state.started_candidates.insert(candidate_index);
+    let slots = state.slots_by_candidate.entry(candidate_index).or_default();
+    let (content, tool_calls) = extract_stream_content_and_tool_calls(parts, slots);
+    let has_tool_calls = !tool_calls.is_empty() || !slots.is_empty();
+    let delta = build_stream_delta(is_first_delta, content, tool_calls);
     let finish = finish_reason.map_or(Value::Null, |_| {
         Value::String(convert_finish_reason(finish_reason, has_tool_calls).to_owned())
     });
 
     let logprobs = candidate
-        .and_then(|c| c.get("logprobsResult"))
+        .get("logprobsResult")
         .and_then(convert_logprobs_result)
         .unwrap_or(Value::Null);
 
-    json!({ "index": 0, "delta": delta, "logprobs": logprobs, "finish_reason": finish })
+    json!({ "index": candidate_index, "delta": delta, "logprobs": logprobs, "finish_reason": finish })
 }
 
 /// Reject SSE frames that carry an upstream error or prompt-level content block.
@@ -726,7 +812,7 @@ mod tests {
     }
 
     fn translate_stream(state: &mut StreamTranslateState, data: &[u8]) -> Value {
-        let output = transform_stream_chunk(data, "gemini-1.5-pro", state).unwrap();
+        let output = transform_stream_chunk(data, "gemini-1.5-pro", state).unwrap().unwrap();
         serde_json::from_slice(&output).unwrap()
     }
 
@@ -1044,6 +1130,21 @@ mod tests {
     }
 
     #[test]
+    fn model_armor_finish_reason_maps_to_content_filter() {
+        // MODEL_ARMOR means the response was blocked by Google's Model Armor
+        // enterprise safety layer. It must NOT silently map to "stop" — that
+        // would misreport a blocked response as a normal completion.
+        let body = br#"{"candidates": [{"content": {"parts": []}, "finishReason": "MODEL_ARMOR"}]}"#;
+        let output = transform_response(body, "gemini-1.5-pro").unwrap();
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+
+        assert_eq!(
+            parsed["choices"][0]["finish_reason"], "content_filter",
+            "MODEL_ARMOR must map to content_filter, not stop"
+        );
+    }
+
+    #[test]
     fn malformed_function_call_maps_to_stop() {
         let body = br#"{"candidates": [{"content": {"parts": []}, "finishReason": "MALFORMED_FUNCTION_CALL"}]}"#;
         let output = transform_response(body, "gemini-1.5-pro").unwrap();
@@ -1158,7 +1259,10 @@ mod tests {
     #[test]
     fn stream_chunk_subsequent_omits_role() {
         let mut state = new_stream_state(1_700_000_000);
-        state.is_first_chunk = false;
+        drop(translate_stream(
+            &mut state,
+            br#"{"candidates":[{"content":{"parts":[{"text":"Hi"}]}}]}"#,
+        ));
         let parsed = translate_stream(
             &mut state,
             br#"{"candidates":[{"content":{"parts":[{"text":" world"}]}}]}"#,
@@ -1171,7 +1275,6 @@ mod tests {
     #[test]
     fn stream_chunk_finish_reason() {
         let mut state = new_stream_state(1_700_000_000);
-        state.is_first_chunk = false;
         let parsed = translate_stream(
             &mut state,
             br#"{"candidates":[{"content":{"parts":[{"text":""}]},"finishReason":"STOP"}]}"#,
@@ -1258,7 +1361,6 @@ mod tests {
             &mut state,
             br#"{"responseId":"resp-s","candidates":[{"content":{"parts":[{"functionCall":{"name":"get_weather","args":{"city":"NYC"}}}]}}]}"#,
         );
-        state.is_first_chunk = false;
         let second = translate_stream(
             &mut state,
             br#"{"responseId":"resp-s","candidates":[{"content":{"parts":[{"functionCall":{"name":"get_calendar","args":{}}}]}}]}"#,
@@ -1282,7 +1384,6 @@ mod tests {
             &mut state,
             br#"{"candidates":[{"content":{"parts":[{"functionCall":{"id":"fc-1","name":"search"}}]}}]}"#,
         );
-        state.is_first_chunk = false;
         let second = translate_stream(
             &mut state,
             br#"{"candidates":[{"content":{"parts":[{"functionCall":{"id":"fc-1","args":{"q":"rust"}}}]}}]}"#,
@@ -1306,7 +1407,6 @@ mod tests {
             &mut state,
             br#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"search"}}]}}]}"#,
         );
-        state.is_first_chunk = false;
         let second = translate_stream(
             &mut state,
             br#"{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"q":"praxis"}}}]}}]}"#,
@@ -1327,7 +1427,6 @@ mod tests {
             &mut state,
             br#"{"candidates":[{"content":{"parts":[{"functionCall":{"id":"fc-dup","name":"search","args":{"q":"a"}}}]}}]}"#,
         );
-        state.is_first_chunk = false;
         let second = translate_stream(
             &mut state,
             br#"{"candidates":[{"content":{"parts":[{"functionCall":{"id":"fc-dup","name":"search","args":{"q":"a"}}}]}}]}"#,
@@ -1344,7 +1443,6 @@ mod tests {
     fn stream_completion_id_is_sticky_when_response_id_arrives_late() {
         let mut state = new_stream_state(1);
         let first = translate_stream(&mut state, br#"{"candidates":[{"content":{"parts":[{"text":"Hi"}]}}]}"#);
-        state.is_first_chunk = false;
         let second = translate_stream(
             &mut state,
             br#"{"responseId":"resp-late","candidates":[{"content":{"parts":[{"text":"!"}]}}]}"#,
@@ -1362,7 +1460,6 @@ mod tests {
             &mut state,
             br#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"search","args":{}}}]}}]}"#,
         ));
-        state.is_first_chunk = false;
         let done = translate_stream(
             &mut state,
             br#"{"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}]}"#,
@@ -1381,7 +1478,6 @@ mod tests {
                 "thoughtSignature":"sig-abc"
             }]}}]}"#,
         );
-        state.is_first_chunk = false;
         let second = translate_stream(
             &mut state,
             br#"{"candidates":[{"content":{"parts":[{"functionCall":{"id":"fc-sig","args":{"q":"x"}}}]}}]}"#,
@@ -1401,7 +1497,6 @@ mod tests {
             &mut state,
             br#"{"candidates":[{"content":{"parts":[{"functionCall":{"id":"fc-sig","name":"search"}}]}}]}"#,
         );
-        state.is_first_chunk = false;
         let second = translate_stream(
             &mut state,
             br#"{"candidates":[{"content":{"parts":[{
@@ -1426,7 +1521,6 @@ mod tests {
             &mut state,
             br#"{"candidates":[{"content":{"parts":[{"functionCall":{"id":"fc-sig","name":"search","args":{}}}]}}]}"#,
         ));
-        state.is_first_chunk = false;
         let second = translate_stream(
             &mut state,
             br#"{"candidates":[{"content":{"parts":[{
@@ -1498,6 +1592,103 @@ mod tests {
     }
 
     #[test]
+    fn stream_include_usage_defers_usage_to_trailing_chunk() {
+        let mut state = new_stream_state(1);
+        state.set_include_usage(true);
+        let parsed = translate_stream(
+            &mut state,
+            br#"{"candidates":[{"content":{"parts":[{"text":"!"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":1,"totalTokenCount":4}}"#,
+        );
+
+        assert!(parsed["usage"].is_null(), "content chunks carry usage: null");
+        assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
+
+        let usage_bytes = take_stream_usage_chunk(&mut state, "gemini-1.5-pro").unwrap();
+        let usage: Value = serde_json::from_slice(&usage_bytes).unwrap();
+        assert_eq!(usage["choices"], json!([]));
+        assert_eq!(usage["usage"]["prompt_tokens"], 3);
+        assert_eq!(usage["usage"]["completion_tokens"], 1);
+        assert_eq!(usage["usage"]["total_tokens"], 4);
+        assert_eq!(usage["id"], parsed["id"]);
+    }
+
+    #[test]
+    fn stream_preserves_all_candidates_and_their_indices() {
+        let mut state = new_stream_state(1);
+        let parsed = translate_stream(
+            &mut state,
+            br#"{"candidates":[{"index":0,"content":{"parts":[{"text":"first"}]}},{"index":1,"content":{"parts":[{"text":"second"}]},"finishReason":"STOP"}]}"#,
+        );
+
+        assert_eq!(parsed["choices"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["choices"][0]["index"], 0);
+        assert_eq!(parsed["choices"][0]["delta"]["content"], "first");
+        assert_eq!(parsed["choices"][1]["index"], 1);
+        assert_eq!(parsed["choices"][1]["delta"]["content"], "second");
+        assert_eq!(parsed["choices"][1]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn stream_tracks_first_delta_and_tool_slots_per_candidate() {
+        let mut state = new_stream_state(1);
+        let first = translate_stream(
+            &mut state,
+            br#"{"candidates":[{"index":0,"content":{"parts":[{"functionCall":{"name":"search","args":{"q":"first"}}}]}}]}"#,
+        );
+        let second = translate_stream(
+            &mut state,
+            br#"{"candidates":[{"index":0,"content":{"parts":[{"text":"continued"}]}},{"index":1,"content":{"parts":[{"functionCall":{"name":"search","args":{"q":"second"}}}]}}]}"#,
+        );
+
+        assert_eq!(first["choices"][0]["delta"]["role"], "assistant");
+        assert!(second["choices"][0]["delta"].get("role").is_none());
+        assert_eq!(second["choices"][1]["delta"]["role"], "assistant");
+        assert_eq!(first["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
+        assert_eq!(second["choices"][1]["delta"]["tool_calls"][0]["index"], 0);
+        assert_ne!(
+            first["choices"][0]["delta"]["tool_calls"][0]["id"], second["choices"][1]["delta"]["tool_calls"][0]["id"],
+            "each candidate must maintain independent tool-call identity"
+        );
+    }
+
+    /// When the client requests `include_usage` but Vertex never sends
+    /// `usageMetadata`, content chunks still carry `usage: null` and no
+    /// trailing usage chunk is produced.  The `[DONE]` sentinel follows
+    /// immediately.  This is intentional: the proxy cannot fabricate
+    /// counts it did not receive.
+    #[test]
+    fn stream_include_usage_without_metadata_emits_no_trailing_chunk() {
+        let mut state = new_stream_state(1);
+        state.set_include_usage(true);
+        // Frame has candidates but NO usageMetadata.
+        let parsed = translate_stream(
+            &mut state,
+            br#"{"candidates":[{"content":{"parts":[{"text":"!"}]},"finishReason":"STOP"}]}"#,
+        );
+
+        assert!(parsed["usage"].is_null(), "content chunk still carries usage: null");
+        assert!(
+            take_stream_usage_chunk(&mut state, "gemini-2.0-flash").is_none(),
+            "no usageMetadata received → no trailing usage chunk"
+        );
+    }
+
+    #[test]
+    fn stream_without_include_usage_omits_usage_field() {
+        let mut state = new_stream_state(1);
+        let parsed = translate_stream(
+            &mut state,
+            br#"{"candidates":[{"content":{"parts":[{"text":"!"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":1,"totalTokenCount":4}}"#,
+        );
+
+        assert!(
+            parsed.get("usage").is_none(),
+            "OpenAI omits usage unless include_usage is set"
+        );
+        assert!(take_stream_usage_chunk(&mut state, "gemini-1.5-pro").is_none());
+    }
+
+    #[test]
     fn stream_usage_only_frame_is_not_an_error() {
         let mut state = new_stream_state(1);
         let result = transform_stream_chunk(
@@ -1506,16 +1697,39 @@ mod tests {
             &mut state,
         );
         assert!(
-            result.is_ok(),
-            "usage-only frame should translate, not error: {result:?}"
+            matches!(result, Ok(None)),
+            "usage-only frame should be skipped, not error: {result:?}"
         );
+    }
+
+    #[test]
+    fn stream_usage_only_frame_feeds_trailing_chunk() {
+        let mut state = new_stream_state(1);
+        state.set_include_usage(true);
+        assert!(
+            transform_stream_chunk(
+                br#"{"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}"#,
+                "gemini-2.0-flash",
+                &mut state,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let usage: Value =
+            serde_json::from_slice(&take_stream_usage_chunk(&mut state, "gemini-2.0-flash").unwrap()).unwrap();
+        assert_eq!(usage["choices"], json!([]));
+        assert_eq!(usage["usage"]["total_tokens"], 15);
     }
 
     #[test]
     fn stream_empty_json_is_not_an_error() {
         let mut state = new_stream_state(1);
         let result = transform_stream_chunk(b"{}", "gemini-2.0-flash", &mut state);
-        assert!(result.is_ok(), "empty JSON should translate, not error: {result:?}");
+        assert!(
+            matches!(result, Ok(None)),
+            "empty JSON should be skipped, not error: {result:?}"
+        );
     }
 
     #[test]
