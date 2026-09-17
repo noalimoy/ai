@@ -6,8 +6,7 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, example_config_path, free_port, http_send, json_post, parse_body, parse_header, parse_status, patch_yaml,
-    start_proxy,
+    Backend, example_config_path, free_port, http_send, parse_body, parse_header, parse_status, patch_yaml, start_proxy,
 };
 use sqlx::Row as _;
 
@@ -18,6 +17,8 @@ use sqlx::Row as _;
 const RESPONSE_JSON: &str = r#"{"id":"resp_stream_example","created_at":1000,"model":"gpt-4.1","object":"response","status":"completed","input":"Hello streaming","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hi from stream"}]}]}"#;
 
 const RESPONSES_TABLE: &str = "openai_responses";
+
+const OWNER_ASSERTION: &str = "v1.WyJzdHJlYW0tdGVuYW50IiwidXJuOnByYXhpczp0ZXN0IiwiYWxpY2UiXQ";
 
 const STREAMING_EXAMPLES: [(&str, u64); 5] = [
     ("openai/responses/agentic-loop.yaml", 360_000),
@@ -83,7 +84,7 @@ async fn stream_events_accumulates_state_and_persists_response_to_sqlite() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post(
+        &json_post_with_owner(
             "/v1/responses",
             r#"{"model":"gpt-4.1","input":"Hello streaming","stream":true}"#,
         ),
@@ -123,7 +124,7 @@ async fn stream_events_accumulates_state_and_persists_response_to_sqlite() {
     let model: String = row.get("model");
 
     assert_eq!(id, "resp_stream_example", "persisted id should match stream");
-    assert_eq!(tenant_id, "default", "default tenant should be used");
+    assert_eq!(tenant_id, "stream-tenant", "trusted owner tenant should be persisted");
     assert_eq!(created_at, 1000, "persisted created_at should match stream");
     assert_eq!(model, "gpt-4.1", "persisted model should match stream");
 
@@ -197,7 +198,7 @@ async fn stream_events_incremental_accumulation_before_terminal() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post(
+        &json_post_with_owner(
             "/v1/responses",
             r#"{"model":"gpt-4.1","input":"Hello streaming","stream":true}"#,
         ),
@@ -255,7 +256,7 @@ async fn stream_events_forwards_backend_error_transparently() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post(
+        &json_post_with_owner(
             "/v1/responses",
             r#"{"model":"nonexistent","input":"Hello","stream":true}"#,
         ),
@@ -277,6 +278,88 @@ async fn stream_events_forwards_backend_error_transparently() {
     cleanup_sqlite_files(&db_path);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_events_fails_closed_when_accumulation_budget_exceeded() {
+    // #556: a backend that streams many individually-valid SSE events whose
+    // aggregate accumulated state crosses the budget must fail the stream closed —
+    // the client sees a terminal error rather than a success, and nothing is
+    // persisted. Exercised end-to-end through the proxy with a tiny
+    // `max_accumulated_bytes` so a small body trips the aggregate byte ceiling.
+    let mut sse_body = String::new();
+    for i in 0..10 {
+        sse_body.push_str(&format!(
+            "event: response.output_item.added\n\
+             data: {{\"type\":\"response.output_item.added\",\"output_index\":{i},\
+             \"item\":{{\"type\":\"message\",\"id\":\"item_{i}\",\"content\":[]}}}}\n\n"
+        ));
+    }
+    sse_body.push_str(&format!(
+        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{RESPONSE_JSON}}}\n\n"
+    ));
+    sse_body.push_str("event: done\ndata: [DONE]\n\n");
+
+    let backend_guard = Backend::fixed(&sse_body)
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+
+    let (db_url, db_path) = temp_sqlite_url("stream_events_overflow");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/stream-events.yaml"))
+        .expect("example config should exist");
+    // Inject a tiny aggregate byte ceiling so the streamed items trip the budget.
+    let yaml = yaml.replace(
+        "- filter: openai_stream_events\n",
+        "- filter: openai_stream_events\n                max_accumulated_bytes: 512\n",
+    );
+    let patched = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", &db_url),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:8000", backend_guard.port())]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_owner(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1","input":"Hello streaming","stream":true}"#,
+        ),
+    );
+
+    // Streaming headers are already sent when the budget trips mid-body, so the
+    // failure surfaces as an in-band terminal error event, not an HTTP status.
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "streaming request returns 200 before the body trips the budget"
+    );
+    let body = parse_body(&raw);
+    assert!(
+        body.contains("event: error"),
+        "budget overflow must terminate the logical stream with an error event: {body}"
+    );
+    assert!(
+        !body.contains("response.completed"),
+        "the poisoned terminal must be suppressed, not forwarded as success: {body}"
+    );
+
+    let pool = sqlx::SqlitePool::connect(&db_url)
+        .await
+        .expect("should connect to test database");
+    let sql = format!("SELECT COUNT(*) AS n FROM {RESPONSES_TABLE}");
+    let row: sqlx::sqlite::SqliteRow = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_one(&pool)
+        .await
+        .expect("count query should succeed");
+    let persisted: i64 = row.get("n");
+    pool.close().await;
+    assert_eq!(persisted, 0, "a budget-overflow stream must not persist any response");
+
+    drop(proxy);
+    cleanup_sqlite_files(&db_path);
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
@@ -290,6 +373,15 @@ fn temp_sqlite_url(test_name: &str) -> (String, std::path::PathBuf) {
         .as_nanos();
     let db_path = std::env::temp_dir().join(format!("praxis_integ_{test_name}_{}_{nanos}.db", std::process::id()));
     (format!("sqlite://{}?mode=rwc", db_path.display()), db_path)
+}
+
+fn json_post_with_owner(path: &str, body: &str) -> String {
+    format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         x-authenticated-state-owner: {OWNER_ASSERTION}\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 fn cleanup_sqlite_files(db_path: &std::path::Path) {
