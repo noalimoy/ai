@@ -148,7 +148,10 @@ pub(crate) fn transform_response(body: &[u8], model: &str) -> Result<Vec<u8>, St
         reject_upstream_error_frame(obj)?;
     }
 
-    let choices = candidates.map(|c| convert_candidates(c)).unwrap_or_default();
+    let choices = match candidates {
+        Some(c) => convert_candidates(c)?,
+        None => Vec::new(),
+    };
 
     let usage = obj
         .and_then(|o| o.get("usageMetadata"))
@@ -171,7 +174,7 @@ pub(crate) fn transform_response(body: &[u8], model: &str) -> Result<Vec<u8>, St
 // -----------------------------------------------------------------------------
 
 /// Convert Gemini `candidates` array to OpenAI `choices`.
-fn convert_candidates(candidates: &[Value]) -> Vec<Value> {
+fn convert_candidates(candidates: &[Value]) -> Result<Vec<Value>, String> {
     candidates
         .iter()
         .enumerate()
@@ -180,7 +183,7 @@ fn convert_candidates(candidates: &[Value]) -> Vec<Value> {
 }
 
 /// Convert a single Gemini candidate to an OpenAI choice.
-fn convert_candidate(candidate: &Value, default_index: usize) -> Value {
+fn convert_candidate(candidate: &Value, default_index: usize) -> Result<Value, String> {
     let index = candidate
         .get("index")
         .and_then(Value::as_u64)
@@ -191,7 +194,7 @@ fn convert_candidate(candidate: &Value, default_index: usize) -> Value {
         .and_then(|c| c.get("parts"))
         .and_then(Value::as_array);
 
-    let (content, tool_calls) = extract_content_and_tool_calls(parts);
+    let (content, tool_calls) = extract_content_and_tool_calls(parts)?;
     let has_tool_calls = !tool_calls.is_empty();
 
     let finish_reason = convert_finish_reason(candidate.get("finishReason").and_then(Value::as_str), has_tool_calls);
@@ -216,7 +219,7 @@ fn convert_candidate(candidate: &Value, default_index: usize) -> Value {
         obj.insert("logprobs".to_owned(), logprobs);
     }
 
-    choice
+    Ok(choice)
 }
 
 // -----------------------------------------------------------------------------
@@ -235,9 +238,9 @@ fn convert_candidate(candidate: &Value, default_index: usize) -> Value {
 /// `functionCall.id` when present; otherwise mint a unique id. Do not derive
 /// the id from `responseId` or the function name — those collide across rounds
 /// or parallel same-name calls.
-fn extract_content_and_tool_calls(parts: Option<&Vec<Value>>) -> (Value, Vec<Value>) {
+fn extract_content_and_tool_calls(parts: Option<&Vec<Value>>) -> Result<(Value, Vec<Value>), String> {
     let Some(parts) = parts else {
-        return (Value::Null, Vec::new());
+        return Ok((Value::Null, Vec::new()));
     };
 
     let mut text_segments = Vec::new();
@@ -249,7 +252,7 @@ fn extract_content_and_tool_calls(parts: Option<&Vec<Value>>) -> (Value, Vec<Val
         }
 
         if let Some(fc) = part.get("functionCall").and_then(Value::as_object) {
-            tool_calls.push(convert_function_call_to_tool_call(part, fc));
+            tool_calls.push(convert_function_call_to_tool_call(part, fc)?);
         }
     }
 
@@ -259,7 +262,7 @@ fn extract_content_and_tool_calls(parts: Option<&Vec<Value>>) -> (Value, Vec<Val
         Value::String(text_segments.join(""))
     };
 
-    (content, tool_calls)
+    Ok((content, tool_calls))
 }
 
 /// Convert a Gemini `functionCall` part to an OpenAI `tool_calls` entry.
@@ -268,9 +271,9 @@ fn extract_content_and_tool_calls(parts: Option<&Vec<Value>>) -> (Value, Vec<Val
 /// `functionCall`), not inside the call object. Chat Completions has no
 /// native field for it; Google's OpenAI-compatible shim stashes the
 /// value at `extra_content.google.thought_signature`.
-fn convert_function_call_to_tool_call(part: &Value, fc: &Map<String, Value>) -> Value {
+fn convert_function_call_to_tool_call(part: &Value, fc: &Map<String, Value>) -> Result<Value, String> {
     let name = fc.get("name").and_then(Value::as_str).unwrap_or("");
-    let args = serialize_function_args(fc);
+    let args = serialize_function_args(fc)?;
 
     let mut call = json!({
         "id": openai_tool_call_id(fc),
@@ -290,7 +293,7 @@ fn convert_function_call_to_tool_call(part: &Value, fc: &Map<String, Value>) -> 
         );
     }
 
-    call
+    Ok(call)
 }
 
 /// Gemini REST puts `thoughtSignature` on the Part; some payloads nest
@@ -317,11 +320,32 @@ fn google_function_call_id(fc: &Map<String, Value>) -> Option<&str> {
 }
 
 /// Serialize Gemini `functionCall.args` to the OpenAI arguments string.
-fn serialize_function_args(fc: &Map<String, Value>) -> String {
-    fc.get("args").map_or_else(
-        || "{}".to_owned(),
-        |a| serde_json::to_string(a).unwrap_or_else(|_| "{}".to_owned()),
-    )
+///
+/// Returns `Ok("{}")` when `args` is absent (no-argument call).
+/// Returns `Err` when `args` is present but is not a JSON object.
+fn serialize_function_args(fc: &Map<String, Value>) -> Result<String, String> {
+    let Some(args) = fc.get("args") else {
+        return Ok("{}".to_owned());
+    };
+    let Value::Object(map) = args else {
+        return Err(format!(
+            "functionCall.args must be a JSON object, got {kind}",
+            kind = json_kind(args),
+        ));
+    };
+    serde_json::to_string(map).map_err(|e| format!("failed to serialize functionCall.args: {e}"))
+}
+
+/// Return the JSON type name of a value for error messages.
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 /// Mint an OpenAI-shaped tool-call id that is unique across rounds and
@@ -505,7 +529,7 @@ pub(crate) fn transform_stream_chunk(
         .flatten()
         .enumerate()
         .map(|(position, candidate)| build_stream_choice(candidate, position as u64, state))
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut chunk = json!({
         "id": state.completion_id.as_deref().unwrap_or(super::FALLBACK_RESPONSE_ID),
@@ -552,7 +576,11 @@ pub(crate) fn take_stream_usage_chunk(state: &mut StreamTranslateState, model: &
 }
 
 /// Build a single OpenAI streaming choice from a Gemini candidate.
-fn build_stream_choice(candidate: &Value, default_index: u64, state: &mut StreamTranslateState) -> Value {
+fn build_stream_choice(
+    candidate: &Value,
+    default_index: u64,
+    state: &mut StreamTranslateState,
+) -> Result<Value, String> {
     let candidate_index = candidate.get("index").and_then(Value::as_u64).unwrap_or(default_index);
     let parts = candidate
         .get("content")
@@ -562,7 +590,7 @@ fn build_stream_choice(candidate: &Value, default_index: u64, state: &mut Stream
     let finish_reason = candidate.get("finishReason").and_then(Value::as_str);
     let is_first_delta = state.started_candidates.insert(candidate_index);
     let slots = state.slots_by_candidate.entry(candidate_index).or_default();
-    let (content, tool_calls) = extract_stream_content_and_tool_calls(parts, slots);
+    let (content, tool_calls) = extract_stream_content_and_tool_calls(parts, slots)?;
     let has_tool_calls = !tool_calls.is_empty() || !slots.is_empty();
     let delta = build_stream_delta(is_first_delta, content, tool_calls);
     let finish = finish_reason.map_or(Value::Null, |_| {
@@ -574,7 +602,7 @@ fn build_stream_choice(candidate: &Value, default_index: u64, state: &mut Stream
         .and_then(convert_logprobs_result)
         .unwrap_or(Value::Null);
 
-    json!({ "index": candidate_index, "delta": delta, "logprobs": logprobs, "finish_reason": finish })
+    Ok(json!({ "index": candidate_index, "delta": delta, "logprobs": logprobs, "finish_reason": finish }))
 }
 
 /// Reject SSE frames that carry an upstream error or prompt-level content block.
@@ -625,9 +653,9 @@ fn reject_upstream_error_frame(obj: Option<&Map<String, Value>>) -> Result<(), S
 fn extract_stream_content_and_tool_calls(
     parts: Option<&Vec<Value>>,
     slots: &mut Vec<ToolCallSlot>,
-) -> (Value, Vec<Value>) {
+) -> Result<(Value, Vec<Value>), String> {
     let Some(parts) = parts else {
-        return (Value::Null, Vec::new());
+        return Ok((Value::Null, Vec::new()));
     };
 
     let mut text_segments = Vec::new();
@@ -638,10 +666,10 @@ fn extract_stream_content_and_tool_calls(
             text_segments.push(text);
         }
 
-        if let Some(fc) = part.get("functionCall").and_then(Value::as_object)
-            && let Some(delta) = stream_tool_call_delta(part, fc, slots)
-        {
-            tool_calls.push(delta);
+        if let Some(fc) = part.get("functionCall").and_then(Value::as_object) {
+            if let Some(delta) = stream_tool_call_delta(part, fc, slots)? {
+                tool_calls.push(delta);
+            }
         }
     }
 
@@ -651,7 +679,7 @@ fn extract_stream_content_and_tool_calls(
         Value::String(text_segments.join(""))
     };
 
-    (content, tool_calls)
+    Ok((content, tool_calls))
 }
 
 /// Resolve a Gemini `functionCall` onto a stream slot and emit one OpenAI
@@ -661,7 +689,11 @@ fn extract_stream_content_and_tool_calls(
 /// 1. Existing slot with the same Vertex `functionCall.id`
 /// 2. Nameless / args-only part → the most recently opened slot
 /// 3. Otherwise a new slot (Google id if present, else minted)
-fn stream_tool_call_delta(part: &Value, fc: &Map<String, Value>, slots: &mut Vec<ToolCallSlot>) -> Option<Value> {
+fn stream_tool_call_delta(
+    part: &Value,
+    fc: &Map<String, Value>,
+    slots: &mut Vec<ToolCallSlot>,
+) -> Result<Option<Value>, String> {
     let index = resolve_stream_slot(fc, slots);
     #[expect(
         clippy::indexing_slicing,
@@ -671,12 +703,12 @@ fn stream_tool_call_delta(part: &Value, fc: &Map<String, Value>, slots: &mut Vec
     let first = !slot.started;
     slot.started = true;
     apply_function_call_to_slot(slot, fc);
-    let function = take_stream_function_delta(slot, fc);
+    let function = take_stream_function_delta(slot, fc)?;
     let thought = take_stream_thought_signature(slot, part, fc);
     if !first && function.is_empty() && thought.is_none() {
-        return None;
+        return Ok(None);
     }
-    Some(assemble_stream_tool_call(index, slot, first, function, thought))
+    Ok(Some(assemble_stream_tool_call(index, slot, first, function, thought)))
 }
 
 /// Build one OpenAI streaming `tool_calls[]` object from slot fields.
@@ -712,18 +744,18 @@ fn apply_function_call_to_slot(slot: &mut ToolCallSlot, fc: &Map<String, Value>)
 }
 
 /// Fields for `delta.tool_calls[].function` that have not been sent yet.
-fn take_stream_function_delta(slot: &mut ToolCallSlot, fc: &Map<String, Value>) -> Map<String, Value> {
+fn take_stream_function_delta(slot: &mut ToolCallSlot, fc: &Map<String, Value>) -> Result<Map<String, Value>, String> {
     let mut function = Map::new();
     if !slot.name_emitted && !slot.name.is_empty() {
         function.insert("name".to_owned(), Value::String(slot.name.clone()));
         slot.name_emitted = true;
     }
     if slot.emitted_args.is_none() && fc.get("args").is_some() {
-        let args = serialize_function_args(fc);
+        let args = serialize_function_args(fc)?;
         function.insert("arguments".to_owned(), Value::String(args.clone()));
         slot.emitted_args = Some(args);
     }
-    function
+    Ok(function)
 }
 
 /// Copy `thoughtSignature` the first time it appears on this slot, including
@@ -1151,6 +1183,45 @@ mod tests {
         let parsed: Value = serde_json::from_slice(&output).unwrap();
 
         assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn function_call_absent_args_becomes_empty_object() {
+        // args absent → valid no-argument call, arguments must be "{}".
+        let body = br#"{"candidates": [{"content": {"parts": [{"functionCall": {"name": "get_time"}}]}, "finishReason": "STOP"}]}"#;
+        let output = transform_response(body, "gemini-1.5-pro").unwrap();
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            parsed["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{}"
+        );
+    }
+
+    #[test]
+    fn function_call_non_object_args_returns_error() {
+        // args is a string, not an object — must be rejected, not silently {}
+        for bad_args in [r#""a string""#, "42", "true", r#"["a","b"]"#] {
+            let body = format!(
+                r#"{{"candidates": [{{"content": {{"parts": [{{"functionCall": {{"name": "f", "args": {bad_args}}}}}]}}, "finishReason": "STOP"}}]}}"#
+            );
+            let err = transform_response(body.as_bytes(), "gemini-1.5-pro").unwrap_err();
+            assert!(
+                err.contains("functionCall.args must be a JSON object"),
+                "expected args type error for {bad_args}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_function_call_non_object_args_returns_error() {
+        // Same validation must fire on the streaming path.
+        let data = br#"{"candidates": [{"content": {"parts": [{"functionCall": {"name": "f", "args": "bad"}}]}, "finishReason": "STOP"}]}"#;
+        let mut state = StreamTranslateState::new();
+        let err = transform_stream_chunk(data, "gemini-1.5-pro", &mut state).unwrap_err();
+        assert!(
+            err.contains("functionCall.args must be a JSON object"),
+            "expected args type error, got: {err}"
+        );
     }
 
     #[test]

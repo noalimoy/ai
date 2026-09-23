@@ -400,7 +400,8 @@ fn translate_sse_frames(ctx: &HttpFilterContext<'_>, state: &mut StreamState, by
 
 /// Render parsed SSE frames into translated OpenAI SSE output bytes.
 ///
-/// Sets `state.had_error` when any individual frame fails to translate.
+/// Stops on the first translation error and sets `state.had_error`; remaining
+/// frames in the chunk are dropped so no valid-looking data follows an error.
 fn render_sse_frames(frames: &[crate::openai::sse::SseFrame], model: &str, state: &mut StreamState) -> Vec<u8> {
     let mut output = Vec::new();
     for frame in frames {
@@ -418,6 +419,7 @@ fn render_sse_frames(frames: &[crate::openai::sse::SseFrame], model: &str, state
             Err(e) => {
                 debug!(error = e.as_str(), "failed to translate Gemini SSE frame");
                 state.had_error = true;
+                break;
             },
         }
     }
@@ -1161,6 +1163,38 @@ mod tests {
             "should emit an error frame, got: {output}"
         );
         assert!(output.ends_with("data: [DONE]\n\n"), "must still end with [DONE]");
+    }
+
+    #[tokio::test]
+    async fn sse_frames_after_error_in_same_chunk_are_not_emitted() {
+        // A chunk that contains an invalid frame followed by a valid one.
+        // Once the first frame errors, the loop must break — the valid
+        // frame that follows must NOT be emitted as translated output.
+        let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
+        let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
+        let req = make_request(Method::POST, "/v1/chat/completions");
+        let mut ctx = make_filter_context(&req);
+        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
+        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
+        ctx.current_filter_id = Some(0);
+
+        // Two SSE frames in one chunk: bad JSON first, then a valid candidate.
+        let chunk = b"data: not-valid-json\n\ndata: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}],\"role\":\"model\"}}]}\n\n";
+        let mut body = Some(Bytes::from(chunk.as_slice()));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        let mid_output = std::str::from_utf8(body.as_ref().unwrap()).unwrap();
+        assert!(
+            !mid_output.contains("chat.completion.chunk"),
+            "valid frame following an error must not be emitted, got: {mid_output}"
+        );
+
+        // End the stream — must emit an error frame, then [DONE].
+        let mut body = Some(Bytes::new());
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+        let output = std::str::from_utf8(body.as_ref().unwrap()).unwrap();
+        assert!(output.contains(r#""error"#), "error frame expected, got: {output}");
+        assert!(output.ends_with("data: [DONE]\n\n"), "must end with [DONE]");
     }
 
     #[tokio::test]

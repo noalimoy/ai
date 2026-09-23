@@ -50,7 +50,7 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<TransformResult, String> 
     let model = extract_model(obj)?;
 
     let stream = extract_stream_flag(obj)?;
-    let include_usage = include_usage_requested(obj, stream);
+    let include_usage = include_usage_requested(obj, stream)?;
 
     let mut gemini = Map::new();
 
@@ -129,18 +129,33 @@ fn extract_stream_flag(obj: &Map<String, Value>) -> Result<bool, String> {
     }
 }
 
-/// OpenAI `stream_options.include_usage` is meaningful only with `stream: true`.
+/// Extract `stream_options.include_usage` from the request.
 ///
-/// Gemini has no equivalent flag: `usageMetadata` always arrives on the
-/// last SSE frame. The filter stashes it and emits the OpenAI usage
-/// chunk only when the client asked for it.
-fn include_usage_requested(obj: &Map<String, Value>, stream: bool) -> bool {
-    stream
-        && obj
-            .get("stream_options")
-            .and_then(|opts| opts.get("include_usage"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+/// Only meaningful with `stream: true`; returns `false` otherwise.
+/// Returns `Err` when the field is present but is not a JSON boolean.
+fn include_usage_requested(obj: &Map<String, Value>, stream: bool) -> Result<bool, String> {
+    let Some(stream_options) = obj.get("stream_options") else {
+        return Ok(false);
+    };
+    let Some(include_usage) = stream_options.get("include_usage") else {
+        return Ok(false);
+    };
+    match include_usage {
+        Value::Bool(b) => Ok(stream && *b),
+        Value::Null => Ok(false),
+        other => {
+            let kind = match other {
+                Value::Number(_) => "number",
+                Value::String(_) => "string",
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+                Value::Bool(_) | Value::Null => unreachable!("handled above"),
+            };
+            Err(format!(
+                "\"stream_options.include_usage\" must be a boolean, got {kind}"
+            ))
+        },
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1295,6 +1310,52 @@ mod tests {
         assert!(
             parsed.get("stream_options").is_none(),
             "Gemini has no stream_options; must not be forwarded"
+        );
+    }
+
+    #[test]
+    fn include_usage_false_is_accepted() {
+        let body = br#"{"model":"gemini-2.0-flash","stream":true,"stream_options":{"include_usage":false},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        assert!(!result.include_usage);
+    }
+
+    #[test]
+    fn include_usage_null_is_accepted() {
+        let body = br#"{"model":"gemini-2.0-flash","stream":true,"stream_options":{"include_usage":null},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        assert!(!result.include_usage);
+    }
+
+    #[test]
+    fn include_usage_string_true_rejected() {
+        // Non-boolean must be rejected with a clear error, not silently ignored.
+        let body = br#"{"model":"gemini-2.0-flash","stream":true,"stream_options":{"include_usage":"true"},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let err = transform_request(body).unwrap_err();
+        assert!(
+            err.contains("stream_options.include_usage") && err.contains("boolean"),
+            "expected boolean type error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn include_usage_number_rejected() {
+        let body = br#"{"model":"gemini-2.0-flash","stream":true,"stream_options":{"include_usage":1},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let err = transform_request(body).unwrap_err();
+        assert!(
+            err.contains("stream_options.include_usage") && err.contains("boolean"),
+            "expected boolean type error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn include_usage_without_stream_is_false() {
+        // include_usage is only meaningful when stream: true.
+        let body = br#"{"model":"gemini-2.0-flash","stream":false,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        assert!(
+            !result.include_usage,
+            "include_usage must be false when stream is false"
         );
     }
 
