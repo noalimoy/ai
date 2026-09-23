@@ -11,7 +11,9 @@
 
 pub mod anthropic;
 pub mod azure;
+mod callout_credentials;
 pub mod callout_headers;
+mod callout_identity;
 pub mod callout_policy;
 pub mod callout_target;
 pub mod classifier;
@@ -31,6 +33,7 @@ pub mod token_cache;
 pub mod vertex;
 pub(crate) mod web_search;
 
+pub use callout_credentials::{CalloutCredentials, CalloutCredentialsFilter};
 pub use state_owner::{StateOwner, StateOwnerError, StateOwnerFilter, project_state_owner};
 pub use state_owner_headers::StateOwnerHeadersFilter;
 
@@ -151,7 +154,7 @@ pub(crate) mod test_utils {
     }
 
     /// Build a stable owner for tests that previously supplied only a tenant.
-    #[cfg(feature = "store-sqlite")]
+    #[cfg(feature = "store")]
     pub(crate) fn test_owner(tenant_id: &str) -> crate::StateOwner {
         crate::StateOwner::from_trusted_parts(tenant_id, "test-issuer", "test-subject")
             .expect("test owner should be valid")
