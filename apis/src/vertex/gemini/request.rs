@@ -55,7 +55,7 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<TransformResult, String> 
     let mut gemini = Map::new();
 
     // Messages → contents + systemInstruction
-    let (contents, system_instruction) = convert_messages(obj);
+    let (contents, system_instruction) = convert_messages(obj)?;
     gemini.insert("contents".to_owned(), Value::Array(contents));
     if let Some(instruction) = system_instruction {
         gemini.insert("systemInstruction".to_owned(), instruction);
@@ -172,9 +172,9 @@ fn include_usage_requested(obj: &Map<String, Value>, stream: bool) -> Result<boo
 /// - `user` → `role: "user"`
 /// - `assistant` → `role: "model"`
 /// - `tool` / `function` → `role: "user"` with `functionResponse` part
-fn convert_messages(obj: &Map<String, Value>) -> (Vec<Value>, Option<Value>) {
+fn convert_messages(obj: &Map<String, Value>) -> Result<(Vec<Value>, Option<Value>), String> {
     let Some(Value::Array(messages)) = obj.get("messages") else {
-        return (Vec::new(), None);
+        return Ok((Vec::new(), None));
     };
 
     let mut contents = Vec::new();
@@ -188,7 +188,7 @@ fn convert_messages(obj: &Map<String, Value>) -> (Vec<Value>, Option<Value>) {
         match role {
             "system" | "developer" => collect_system_parts(&mut system_parts, msg),
             "user" => convert_user_message(&mut contents, msg),
-            "assistant" => convert_assistant_message(&mut contents, msg),
+            "assistant" => convert_assistant_message(&mut contents, msg)?,
             "tool" | "function" => convert_tool_result(&mut contents, messages, i, msg),
             _ => {
                 warn!(role, "dropping message with unknown role");
@@ -202,7 +202,7 @@ fn convert_messages(obj: &Map<String, Value>) -> (Vec<Value>, Option<Value>) {
         Some(json!({ "parts": system_parts }))
     };
 
-    (contents, system_instruction)
+    Ok((contents, system_instruction))
 }
 
 // -----------------------------------------------------------------------------
@@ -328,7 +328,7 @@ fn guess_mime_type(url: &str) -> &'static str {
 ///
 /// Handles plain text, tool calls (`functionCall` parts), and any
 /// `thoughtSignature` stashed on the tool call as `extra_content`.
-fn convert_assistant_message(contents: &mut Vec<Value>, msg: &Value) {
+fn convert_assistant_message(contents: &mut Vec<Value>, msg: &Value) -> Result<(), String> {
     let mut parts = Vec::new();
 
     if let Some(text) = msg.get("content").and_then(Value::as_str)
@@ -339,7 +339,7 @@ fn convert_assistant_message(contents: &mut Vec<Value>, msg: &Value) {
 
     if let Some(Value::Array(tool_calls)) = msg.get("tool_calls") {
         for tc in tool_calls {
-            if let Some(fc) = convert_tool_call(tc) {
+            if let Some(fc) = convert_tool_call(tc)? {
                 parts.push(fc);
             }
         }
@@ -348,16 +348,19 @@ fn convert_assistant_message(contents: &mut Vec<Value>, msg: &Value) {
     if !parts.is_empty() {
         contents.push(json!({ "role": "model", "parts": parts }));
     }
+
+    Ok(())
 }
 
 /// Convert a single OpenAI tool call to a Gemini `functionCall` part.
 ///
-/// Gemini 3 requires the previous turn's `thoughtSignature` verbatim on
-/// each `functionCall` part. Chat Completions clients carry it in
-/// `extra_content.google.thought_signature` (Google's OpenAI-compatible
-/// extension); copy it back onto the Part when present.
-fn convert_tool_call(tc: &Value) -> Option<Value> {
-    let name = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str)?;
+/// Copies `extra_content.google.thought_signature` onto the Part when present
+/// (required by Gemini 3 for tool continuations). Returns `Err` when
+/// `function.arguments` is not valid JSON or not a JSON object.
+fn convert_tool_call(tc: &Value) -> Result<Option<Value>, String> {
+    let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str) else {
+        return Ok(None);
+    };
 
     let args_str = tc
         .get("function")
@@ -365,7 +368,15 @@ fn convert_tool_call(tc: &Value) -> Option<Value> {
         .and_then(Value::as_str)
         .unwrap_or("{}");
 
-    let args: Value = serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
+    let args: Value =
+        serde_json::from_str(args_str).map_err(|e| format!("tool call arguments are not valid JSON: {e}"))?;
+
+    if !args.is_object() {
+        return Err(format!(
+            "tool call arguments must be a JSON object, got {kind}",
+            kind = json_kind(&args),
+        ));
+    }
 
     let mut part = json!({
         "functionCall": {
@@ -381,7 +392,19 @@ fn convert_tool_call(tc: &Value) -> Option<Value> {
         obj.insert("thoughtSignature".to_owned(), sig.clone());
     }
 
-    Some(part)
+    Ok(Some(part))
+}
+
+/// Return the JSON type name of a value for error messages.
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -401,7 +424,12 @@ fn convert_tool_result(contents: &mut Vec<Value>, messages: &[Value], index: usi
 
     let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
 
-    let response: Value = serde_json::from_str(content).unwrap_or_else(|_| json!({ "result": content }));
+    // Gemini response must be a Struct (JSON object); wrap plain text and
+    // valid-but-non-object JSON (arrays, numbers) in {"result": ...}.
+    let response: Value = match serde_json::from_str::<Value>(content) {
+        Ok(Value::Object(map)) => Value::Object(map),
+        _ => json!({ "result": content }),
+    };
 
     contents.push(json!({
         "role": "user",
@@ -864,6 +892,29 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_json_non_object_content_wrapped() {
+        // Valid non-object JSON (array, number, etc.) must be wrapped in
+        // {"result": ...} — Gemini functionResponse.response requires a Struct.
+        for (content, label) in [(r#"[1,2,3]"#, "array"), (r#"42"#, "number"), (r#"true"#, "boolean")] {
+            let body = format!(
+                r#"{{"model":"gemini-1.5-pro","messages":[{{"role":"tool","name":"f","content":"{content}"}}]}}"#
+            );
+            let result = transform_request(body.as_bytes()).unwrap();
+            let parsed: Value = serde_json::from_slice(&result.body).unwrap();
+            let resp = &parsed["contents"][0]["parts"][0]["functionResponse"]["response"];
+            assert!(
+                resp.is_object(),
+                "{label} tool content must produce an object response, got: {resp}"
+            );
+            assert_eq!(
+                resp["result"].as_str().unwrap_or(""),
+                content,
+                "{label} content should be preserved as the 'result' string"
+            );
+        }
+    }
+
+    #[test]
     fn tool_result_unresolvable_falls_back_to_unknown() {
         // No name, no matching tool_call_id in history → "unknown"
         let body = br#"{"model":"gemini-1.5-pro","messages":[
@@ -998,6 +1049,36 @@ mod tests {
 
         assert_eq!(fr["name"], "get_weather");
         assert!(fr.get("id").is_none());
+    }
+
+    #[test]
+    fn assistant_tool_call_invalid_json_args_rejected() {
+        // arguments is not valid JSON — must be rejected with a clear error.
+        let body = br#"{"model":"gemini-1.5-pro","messages":[
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"not-json"}}
+            ]}
+        ]}"#;
+        let err = transform_request(body).unwrap_err();
+        assert!(
+            err.contains("not valid JSON"),
+            "error should mention invalid JSON: {err}"
+        );
+    }
+
+    #[test]
+    fn assistant_tool_call_non_object_args_rejected() {
+        // arguments is valid JSON but not an object — must be rejected.
+        for bad in [r#""[1,2,3]""#, r#""42""#, r#""true""#, r#""\"a string\"""#] {
+            let body = format!(
+                r#"{{"model":"gemini-1.5-pro","messages":[{{"role":"assistant","content":null,"tool_calls":[{{"id":"c","type":"function","function":{{"name":"f","arguments":{bad}}}}}]}}]}}"#
+            );
+            let err = transform_request(body.as_bytes()).unwrap_err();
+            assert!(
+                err.contains("JSON object"),
+                "expected object type error for arguments={bad}, got: {err}"
+            );
+        }
     }
 
     #[test]

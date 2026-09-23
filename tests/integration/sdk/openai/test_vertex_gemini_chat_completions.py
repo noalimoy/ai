@@ -178,13 +178,17 @@ class FakeVertexGeminiHandler(BaseHTTPRequestHandler):
         """Respond to streamGenerateContent with SSE frames in Gemini format."""
         contents = request_json.get("contents", [])
         user_text = ""
+        has_tool_use = bool(request_json.get("tools"))
         if contents:
             parts = contents[0].get("parts", [])
             if parts and "text" in parts[0]:
                 user_text = parts[0]["text"]
 
         # Generate all chunks first to compute total size (for Content-Length)
-        chunks = self._make_gemini_streaming_chunks(user_text)
+        if has_tool_use:
+            chunks = self._make_gemini_streaming_tool_chunks()
+        else:
+            chunks = self._make_gemini_streaming_chunks(user_text)
         body_lines = []
         for chunk in chunks:
             frame = f"data: {json.dumps(chunk)}\n\n"
@@ -286,6 +290,48 @@ class FakeVertexGeminiHandler(BaseHTTPRequestHandler):
         )
 
         return chunks
+
+    def _make_gemini_streaming_tool_chunks(self) -> list[dict[str, Any]]:
+        """Synthesize Gemini SSE streaming chunks for a function call response."""
+        return [
+            # Frame 1: functionCall part (no finishReason yet)
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "functionCall": {
+                                        "name": "get_weather",
+                                        "args": {"location": "Paris"},
+                                    }
+                                }
+                            ],
+                            "role": "model",
+                        },
+                        "index": 0,
+                    }
+                ],
+                "responseId": "resp-tool-stream-001",
+            },
+            # Frame 2: finishReason only — slots accumulated from frame 1
+            # make finish_reason resolve to "tool_calls" on the proxy
+            {
+                "candidates": [
+                    {
+                        "content": {"parts": [], "role": "model"},
+                        "finishReason": "STOP",
+                        "index": 0,
+                    }
+                ],
+                "usageMetadata": {
+                    "promptTokenCount": 12,
+                    "candidatesTokenCount": 8,
+                    "totalTokenCount": 20,
+                },
+                "responseId": "resp-tool-stream-001",
+            },
+        ]
 
     def _synthesize_response(self, user_text: str, has_tools: bool) -> str:
         """Generate a response based on user input."""
@@ -554,6 +600,49 @@ class TestVertexGeminiChatCompletions:
             }
         ]
         assert request_body["toolConfig"] == {"functionCallingConfig": {"mode": "ANY"}}
+
+    def test_streaming_tool_call(self, openai_client: OpenAI) -> None:
+        """Streaming tool call produces correct delta structure for the OpenAI SDK."""
+        chunks = []
+        with openai_client.chat.completions.create(
+            model="gemini-2.0-flash",
+            messages=[{"role": "user", "content": "What is the weather in Paris?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather for a location",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                            "required": ["location"],
+                        },
+                    },
+                }
+            ],
+            tool_choice="required",
+            stream=True,
+        ) as stream:
+            for chunk in stream:
+                chunks.append(chunk)
+
+        assert len(chunks) >= 2, "Expected at least a tool-call delta chunk and a finish chunk"
+
+        # First delta must carry tool_calls with the correct index and metadata.
+        tool_chunks = [c for c in chunks if c.choices[0].delta.tool_calls]
+        assert len(tool_chunks) >= 1, "No chunk had delta.tool_calls"
+        first_tc = tool_chunks[0].choices[0].delta.tool_calls[0]
+        assert first_tc.index == 0
+        assert first_tc.id is not None and first_tc.id.startswith("call_")
+        assert first_tc.type == "function"
+        assert first_tc.function.name == "get_weather"
+        assert json.loads(first_tc.function.arguments) == {"location": "Paris"}
+
+        # The final chunk with finish_reason must report "tool_calls".
+        finish_chunk = next((c for c in reversed(chunks) if c.choices[0].finish_reason), None)
+        assert finish_chunk is not None, "No chunk carried finish_reason"
+        assert finish_chunk.choices[0].finish_reason == "tool_calls"
 
     def test_upstream_error(self, openai_client: OpenAI) -> None:
         """Vertex errors retain their status and become OpenAI SDK exceptions."""

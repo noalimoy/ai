@@ -354,9 +354,16 @@ fn new_stream_state(ctx: &HttpFilterContext<'_>, max_body_bytes: usize) -> Strea
     }
 }
 
-/// Close an SSE stream: error frame or usage chunk, then always `[DONE]`.
+/// Close an SSE stream.
+///
+/// Emits an error frame when `had_error` is set, when the byte parser has
+/// an incomplete frame at EOF, or when the stream closed without any
+/// candidate ever carrying `finishReason` (truncated connection). Otherwise
+/// appends a usage chunk (if requested). Always ends with `[DONE]`.
 fn finish_sse_stream(ctx: &HttpFilterContext<'_>, state: &mut StreamState, output: &mut Vec<u8>) {
-    if state.had_error || state.parser.has_incomplete_frame() {
+    // Truncated: closed cleanly but no finishReason was ever seen on any frame.
+    let truncated = !state.translate.saw_finish_reason() && !state.had_error;
+    if state.had_error || state.parser.has_incomplete_frame() || truncated {
         append_stream_error_frame(output);
     } else {
         append_stream_usage_frame(ctx, state, output);
@@ -386,6 +393,11 @@ fn append_stream_usage_frame(ctx: &HttpFilterContext<'_>, state: &mut StreamStat
 /// the overflow. This is intentional: partial recovery from a corrupted
 /// byte stream risks emitting truncated JSON to the client.
 fn translate_sse_frames(ctx: &HttpFilterContext<'_>, state: &mut StreamState, bytes: &Bytes) -> Vec<u8> {
+    // Sticky error: suppress all subsequent chunks once an error is set.
+    if state.had_error {
+        return Vec::new();
+    }
+
     let model = ctx.get_metadata(REQUEST_MODEL_KEY).unwrap_or("unknown");
 
     match state.parser.parse_chunk(bytes) {
@@ -401,7 +413,8 @@ fn translate_sse_frames(ctx: &HttpFilterContext<'_>, state: &mut StreamState, by
 /// Render parsed SSE frames into translated OpenAI SSE output bytes.
 ///
 /// Stops on the first translation error and sets `state.had_error`; remaining
-/// frames in the chunk are dropped so no valid-looking data follows an error.
+/// frames in the chunk are dropped. Later chunks are suppressed by the
+/// early-return guard in `translate_sse_frames`.
 fn render_sse_frames(frames: &[crate::openai::sse::SseFrame], model: &str, state: &mut StreamState) -> Vec<u8> {
     let mut output = Vec::new();
     for frame in frames {
@@ -896,10 +909,18 @@ mod tests {
         let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
         let req = make_request(Method::POST, "/v1/chat/completions");
         let mut ctx = make_filter_context(&req);
+        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
         ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
+        ctx.current_filter_id = Some(0);
 
-        // Gemini doesn't send [DONE] — the proxy emits it when the
-        // connection closes (end_of_stream=true with empty body).
+        // First deliver a content frame with finishReason so the stream is
+        // considered complete. Gemini doesn't send [DONE] — the proxy appends
+        // it when the connection closes (end_of_stream=true with empty body).
+        let sse_data =
+            b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+        let mut body = Some(Bytes::from(sse_data.to_vec()));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
         let mut body = Some(Bytes::new());
         drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
@@ -907,8 +928,77 @@ mod tests {
         let output = std::str::from_utf8(output_bytes.as_ref()).unwrap();
         assert_eq!(
             output, "data: [DONE]\n\n",
-            "proxy must emit [DONE] for OpenAI clients when stream ends"
+            "proxy must emit [DONE] for OpenAI clients when stream ends cleanly"
         );
+    }
+
+    #[tokio::test]
+    async fn sse_eof_without_finish_reason_emits_error_frame() {
+        // A stream that closes cleanly (no parse error, no incomplete frame)
+        // but never delivered a finishReason must be treated as truncated.
+        let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
+        let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
+        let req = make_request(Method::POST, "/v1/chat/completions");
+        let mut ctx = make_filter_context(&req);
+        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
+        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
+        ctx.current_filter_id = Some(0);
+
+        // Valid JSON frame, no parse error — but no finishReason.
+        let mut body = Some(Bytes::from_static(
+            b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}]}}]}\n\n",
+        ));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        // Stream closes cleanly.
+        let mut body = Some(Bytes::new());
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+        let output = std::str::from_utf8(body.as_ref().unwrap()).unwrap();
+
+        assert!(
+            output.contains(r#""error"#),
+            "truncated stream (no finishReason) should emit an error frame, got: {output}"
+        );
+        assert!(output.contains("server_error"), "error type should be server_error");
+        assert!(output.ends_with("data: [DONE]\n\n"), "must still end with [DONE]");
+    }
+
+    #[tokio::test]
+    async fn sse_had_error_in_earlier_chunk_suppresses_later_chunks() {
+        // Error state is sticky: a translation error in chunk N must suppress
+        // all output from chunk N+1 onwards, not just the rest of chunk N.
+        let yaml: serde_yaml::Value = serde_yaml::from_str("project: p").unwrap();
+        let filter = OpenaiChatCompletionsToVertexaiGeminiFilter::from_config(&yaml).unwrap();
+        let req = make_request(Method::POST, "/v1/chat/completions");
+        let mut ctx = make_filter_context(&req);
+        ctx.set_metadata(REQUEST_MODEL_KEY, "gemini-2.0-flash".to_owned());
+        ctx.set_metadata(RESPONSE_TRANSFORM_KEY, RESPONSE_TRANSFORM_SSE.to_owned());
+        ctx.current_filter_id = Some(0);
+
+        // Chunk 1: invalid JSON frame — sets had_error.
+        let mut body = Some(Bytes::from_static(b"data: not-json-at-all\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        // Chunk 2: valid frame — must be suppressed because had_error is sticky.
+        let mut body = Some(Bytes::from_static(
+            b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}],\"role\":\"model\"},\"finishReason\":\"STOP\"}]}\n\n",
+        ));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let mid_output = std::str::from_utf8(body.as_ref().unwrap()).unwrap();
+        assert!(
+            !mid_output.contains("chat.completion.chunk"),
+            "valid frame in a later chunk after an error must be suppressed, got: {mid_output}"
+        );
+
+        // End the stream — error frame expected.
+        let mut body = Some(Bytes::new());
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+        let output = std::str::from_utf8(body.as_ref().unwrap()).unwrap();
+        assert!(
+            output.contains(r#""error"#),
+            "error frame expected after sticky error, got: {output}"
+        );
+        assert!(output.ends_with("data: [DONE]\n\n"), "must end with [DONE]");
     }
 
     #[tokio::test]

@@ -47,6 +47,11 @@ pub(crate) struct StreamTranslateState {
     /// chunk with `choices: []`, so this is stashed rather than emitted
     /// inline.
     usage: Option<Value>,
+    /// Set when any candidate in any frame has carried a non-null `finishReason`.
+    /// A stream that closes without one is treated as truncated. With `n > 1`,
+    /// any single candidate's `finishReason` satisfies the check; per-candidate
+    /// tracking is not implemented.
+    saw_finish_reason: bool,
 }
 
 /// One OpenAI `tool_calls[]` entry assembled across Gemini SSE frames.
@@ -81,7 +86,13 @@ impl StreamTranslateState {
             started_candidates: BTreeSet::new(),
             include_usage: false,
             usage: None,
+            saw_finish_reason: false,
         }
+    }
+
+    /// Returns `true` once any frame has carried `finishReason` on any candidate.
+    pub(crate) fn saw_finish_reason(&self) -> bool {
+        self.saw_finish_reason
     }
 
     /// Enable the OpenAI trailing usage chunk for this stream.
@@ -146,12 +157,10 @@ pub(crate) fn transform_response(body: &[u8], model: &str) -> Result<Vec<u8>, St
 
     if candidates.is_none() {
         reject_upstream_error_frame(obj)?;
+        return Err("Vertex response contained no candidates".to_owned());
     }
 
-    let choices = match candidates {
-        Some(c) => convert_candidates(c)?,
-        None => Vec::new(),
-    };
+    let choices = convert_candidates(candidates.expect("checked above"))?;
 
     let usage = obj
         .and_then(|o| o.get("usageMetadata"))
@@ -588,6 +597,9 @@ fn build_stream_choice(
         .and_then(Value::as_array);
 
     let finish_reason = candidate.get("finishReason").and_then(Value::as_str);
+    if finish_reason.is_some() {
+        state.saw_finish_reason = true;
+    }
     let is_first_delta = state.started_candidates.insert(candidate_index);
     let slots = state.slots_by_candidate.entry(candidate_index).or_default();
     let (content, tool_calls) = extract_stream_content_and_tool_calls(parts, slots)?;
