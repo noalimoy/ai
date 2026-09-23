@@ -73,36 +73,37 @@ fn default_max_body_bytes() -> usize {
 pub(super) const FILTER_NAME: &str = "openai_chat_completions_to_vertexai_gemini";
 
 /// Validate the parsed configuration.
-pub(crate) fn build_config(cfg: VertexGeminiConfig) -> Result<VertexGeminiConfig, FilterError> {
+pub(crate) fn build_config(mut cfg: VertexGeminiConfig) -> Result<VertexGeminiConfig, FilterError> {
     validate_max_body_bytes(FILTER_NAME, cfg.max_body_bytes)?;
-    if cfg.project.is_empty() {
-        return Err(FilterError::from(format!("{FILTER_NAME}: project must not be empty")));
-    }
-    if cfg.region.is_empty() {
-        return Err(FilterError::from(format!("{FILTER_NAME}: region must not be empty")));
-    }
-    validate_path_segment("project", &cfg.project)?;
-    validate_path_segment("region", &cfg.region)?;
+    cfg.project = validate_path_segment("project", &cfg.project)?;
+    cfg.region = validate_path_segment("region", &cfg.region)?;
     Ok(cfg)
 }
 
-/// Reject config values that would produce malformed or traversable URL paths.
+/// Trim and validate a config value interpolated into the Vertex AI URL path.
 ///
-/// Both `project` and `region` are interpolated into the Vertex AI URL
-/// path. Characters like `/`, `?`, `#`, and sequences like `..` could
-/// alter the request target if present in a misconfigured value.
-fn validate_path_segment(field: &str, value: &str) -> Result<(), FilterError> {
-    if value.contains('/')
-        || value.contains('?')
-        || value.contains('#')
-        || value.contains("..")
-        || value.bytes().any(|b| b.is_ascii_control())
-    {
+/// Returns the trimmed value on success so callers can store the
+/// canonical form. Rejects values that are empty or whitespace-only
+/// (both produce empty path segments), and values containing characters
+/// outside the URL-safe set `[A-Za-z0-9\-._]`. Characters like space,
+/// `@`, `[`, `]`, `%`, etc. require percent-encoding and would produce
+/// malformed URLs; `/`, `?`, `#`, and `..` could alter routing.
+fn validate_path_segment(field: &str, value: &str) -> Result<String, FilterError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
         return Err(FilterError::from(format!(
-            "{FILTER_NAME}: {field} must not contain '/', '?', '#', '..', or control characters"
+            "{FILTER_NAME}: {field} must not be empty or whitespace-only"
         )));
     }
-    Ok(())
+    if trimmed
+        .bytes()
+        .any(|b| !b.is_ascii_alphanumeric() && b != b'-' && b != b'.' && b != b'_')
+    {
+        return Err(FilterError::from(format!(
+            "{FILTER_NAME}: {field} must contain only alphanumeric, '-', '.', or '_' characters"
+        )));
+    }
+    Ok(trimmed.to_owned())
 }
 
 // -----------------------------------------------------------------------------
@@ -143,8 +144,28 @@ max_body_bytes: 2097152
         let yaml = serde_yaml::from_str::<VertexGeminiConfig>(r#"project: """#).unwrap();
         let err = build_config(yaml).unwrap_err();
         assert!(
-            err.to_string().contains("project must not be empty"),
+            err.to_string().contains("project"),
             "expected project error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_project_fails() {
+        let yaml = serde_yaml::from_str::<VertexGeminiConfig>(r#"project: "   ""#).unwrap();
+        let err = build_config(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("project"),
+            "whitespace-only project should be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn whitespace_padded_project_is_trimmed() {
+        let yaml = serde_yaml::from_str::<VertexGeminiConfig>(r#"project: "  my-project  ""#).unwrap();
+        let cfg = build_config(yaml).unwrap();
+        assert_eq!(
+            cfg.project, "my-project",
+            "leading/trailing whitespace must be stripped"
         );
     }
 
@@ -158,10 +179,7 @@ region: ""
         )
         .unwrap();
         let err = build_config(yaml).unwrap_err();
-        assert!(
-            err.to_string().contains("region must not be empty"),
-            "expected region error, got: {err}"
-        );
+        assert!(err.to_string().contains("region"), "expected region error, got: {err}");
     }
 
     #[test]
@@ -175,7 +193,7 @@ region: ""
         let yaml = serde_yaml::from_str::<VertexGeminiConfig>(r#"project: "my-proj/../../other""#).unwrap();
         let err = build_config(yaml).unwrap_err();
         assert!(
-            err.to_string().contains("must not contain"),
+            err.to_string().contains("alphanumeric"),
             "path traversal should be rejected, got: {err}"
         );
     }
@@ -191,9 +209,21 @@ region: "us-central1?foo=bar"
         .unwrap();
         let err = build_config(yaml).unwrap_err();
         assert!(
-            err.to_string().contains("must not contain"),
+            err.to_string().contains("alphanumeric"),
             "query char should be rejected, got: {err}"
         );
+    }
+
+    #[test]
+    fn project_with_url_unsafe_chars_rejected() {
+        for bad in ["my@project", "proj[1]", "my%project", "my project"] {
+            let yaml = serde_yaml::from_str::<VertexGeminiConfig>(&format!(r#"project: "{bad}""#)).unwrap();
+            let err = build_config(yaml).unwrap_err();
+            assert!(
+                err.to_string().contains("alphanumeric"),
+                "'{bad}' should be rejected, got: {err}"
+            );
+        }
     }
 
     #[test]

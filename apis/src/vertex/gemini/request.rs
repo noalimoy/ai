@@ -97,20 +97,20 @@ fn extract_model(obj: &Map<String, Value>) -> Result<String, String> {
         .and_then(Value::as_str)
         .ok_or_else(|| "request body must contain a \"model\" field".to_owned())?;
 
-    if model.is_empty() {
-        return Err("model name must not be empty".to_owned());
+    let trimmed = model.trim();
+
+    if trimmed.is_empty() {
+        return Err("model name must not be empty or whitespace-only".to_owned());
     }
 
-    if model.contains('/')
-        || model.contains('?')
-        || model.contains('#')
-        || model.contains("..")
-        || model.bytes().any(|b| b.is_ascii_control())
+    if trimmed
+        .bytes()
+        .any(|b| !b.is_ascii_alphanumeric() && b != b'-' && b != b'.' && b != b'_')
     {
-        return Err("model name contains characters unsafe for URL path interpolation".to_owned());
+        return Err("model name must contain only alphanumeric, '-', '.', or '_' characters".to_owned());
     }
 
-    Ok(model.to_owned())
+    Ok(trimmed.to_owned())
 }
 
 /// Extract and validate the `stream` field from the request body.
@@ -1199,17 +1199,41 @@ mod tests {
     fn model_with_path_traversal_rejected() {
         let body = br#"{"model":"../../other-model","messages":[{"role":"user","content":"Hi"}]}"#;
         let err = transform_request(body).unwrap_err();
-        assert!(err.contains("unsafe"), "{err}");
+        assert!(err.contains("alphanumeric"), "{err}");
     }
 
     #[test]
     fn empty_model_rejected() {
-        // An empty model name passes character validation but produces a
-        // malformed Vertex path ("/models/:generateContent"). Must be
-        // rejected with a 400 before the path is rewritten.
         let body = br#"{"model":"","messages":[{"role":"user","content":"Hi"}]}"#;
         let err = transform_request(body).unwrap_err();
         assert!(err.contains("empty"), "error should mention empty: {err}");
+    }
+
+    #[test]
+    fn whitespace_only_model_rejected() {
+        // "   ".is_empty() is false — trimming must happen before the empty check.
+        let body = br#"{"model":"   ","messages":[{"role":"user","content":"Hi"}]}"#;
+        let err = transform_request(body).unwrap_err();
+        assert!(err.contains("empty"), "whitespace-only model must be rejected: {err}");
+    }
+
+    #[test]
+    fn whitespace_padded_model_is_trimmed() {
+        let body = br#"{"model":"  gemini-2.0-flash  ","messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_request(body).unwrap();
+        assert_eq!(
+            result.model, "gemini-2.0-flash",
+            "whitespace must be stripped from model"
+        );
+    }
+
+    #[test]
+    fn model_with_url_unsafe_chars_rejected() {
+        for bad in ["gemini@2.0", "model[1]", "my%model", "my model", "gemini:2.0"] {
+            let body = format!(r#"{{"model":"{bad}","messages":[{{"role":"user","content":"Hi"}}]}}"#);
+            let err = transform_request(body.as_bytes()).unwrap_err();
+            assert!(err.contains("alphanumeric"), "'{bad}' should be rejected, got: {err}");
+        }
     }
 
     #[test]
