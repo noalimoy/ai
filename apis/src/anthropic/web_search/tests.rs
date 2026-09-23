@@ -25,10 +25,7 @@ use crate::{
 
 /// A callout identity with no owner and no per-user credential (shared-key path).
 fn shared_key_identity() -> CalloutIdentity {
-    CalloutIdentity {
-        owner: None,
-        user_credential: None,
-    }
+    CalloutIdentity::for_test(None, None)
 }
 
 fn test_filter() -> Box<dyn HttpFilter> {
@@ -69,7 +66,7 @@ outbound_chain: web_search_outbound
     .unwrap();
     let config: WebSearchFilterConfig = parse_filter_config(FILTER_NAME, &config).unwrap();
     let validated = build_config(FILTER_NAME, &config).unwrap();
-    let client = crate::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
+    let client = crate::subrequest::isolated_client(4);
     let search_client = SearchClient::from_config(FILTER_NAME, &validated, client).unwrap();
     // Bind a minimal builtin-only outbound chain; the executor seeds the staged
     // upstream from the search client and still enforces SSRF/TLS/Host, and
@@ -1496,7 +1493,7 @@ fn present_required_credential_resolves_to_per_user_secret() {
 
     assert_eq!(
         identity
-            .user_credential
+            .user_credential()
             .expect("per-user secret present")
             .expose_secret(),
         "user-secret"
@@ -1514,7 +1511,7 @@ fn absent_slot_resolves_without_a_credential() {
         .expect("no configured slot resolves without a credential");
 
     assert!(
-        identity.user_credential.is_none(),
+        identity.user_credential().is_none(),
         "no slot configured means no per-user credential is selected"
     );
 }

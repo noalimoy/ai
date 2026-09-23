@@ -138,6 +138,7 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
     register_state_owner(registry);
     register_state_owner_headers(registry);
     register_callout_credentials(registry);
+    register_callout_authorization(registry);
     #[cfg(feature = "http-callout-filter")]
     praxis_filter::register_filters!(
         @register registry,
@@ -333,6 +334,20 @@ fn register_callout_credentials(registry: &mut FilterRegistry) {
         .unwrap_or_else(|_| panic!("duplicate filter name: 'callout_credentials'"));
 }
 
+/// Register the trusted MCP authorization assertion filter as security-critical.
+#[expect(clippy::panic, reason = "duplicate filter registration is a fatal configuration bug")]
+fn register_callout_authorization(registry: &mut FilterRegistry) {
+    registry
+        .register_with_class(
+            "callout_authorization",
+            praxis_filter::FilterFactory::Http(std::sync::Arc::new(
+                praxis_ai_apis::CalloutAuthorizationFilter::from_config,
+            )),
+            praxis_filter::SecurityClass::Security,
+        )
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'callout_authorization'"));
+}
+
 /// Register OpenAI Responses API filters.
 #[cfg(feature = "openai-responses")]
 fn register_openai_responses_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
@@ -457,7 +472,7 @@ fn register_openai_agentic_filters(registry: &mut FilterRegistry) {
 /// optional outbound chain at construction time.
 #[expect(clippy::panic, reason = "matches register_filters! macro convention")]
 fn register_ai_guardrails(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
-    let isolated_client = SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
+    let isolated_client = crate::isolated_subrequest_client(4);
     let shared_client = subrequest_client.cloned();
 
     registry
@@ -525,7 +540,7 @@ fn register_file_resolve(registry: &mut FilterRegistry, subrequest_client: Optio
                 let outbound = std::sync::Arc::new(ctx.bind_chain(&chain_ref)?);
                 let client = match &shared {
                     Some(client) => client.clone(),
-                    None => SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
+                    None => crate::isolated_subrequest_client(4),
                 };
                 praxis_ai_apis::openai::FileResolveFilter::from_config_with_outbound(config, client, outbound)
             }),
@@ -567,7 +582,7 @@ fn register_compact(registry: &mut FilterRegistry, subrequest_client: Option<&Su
 fn register_file_search_callout(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     let client = subrequest_client
         .cloned()
-        .unwrap_or_else(|| SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)));
+        .unwrap_or_else(|| crate::isolated_subrequest_client(4));
     registry
         .register_chain_binding(
             "openai_file_search_callout",
@@ -638,6 +653,7 @@ mod tests {
             "state_owner",
             "state_owner_headers",
             "callout_credentials",
+            "callout_authorization",
             "openai_responses_format",
             "openai_responses_model_rewrite",
             "openai_tool_parse",
@@ -655,6 +671,16 @@ mod tests {
         for name in expected {
             assert!(names.contains(&name), "expected {name} in registry");
         }
+    }
+
+    #[cfg(feature = "policy-engine")]
+    #[test]
+    fn build_ai_registry_includes_policy_when_enabled() {
+        let registry = build_ai_registry();
+        assert!(
+            registry.available_filters().contains(&"policy"),
+            "the default standard profile preserves the Praxis policy builtin"
+        );
     }
 
     #[test]
@@ -768,6 +794,7 @@ provider:
         #[cfg(feature = "aws-sigv4-filter")]
         assert!(registry.is_security_filter("aws_sigv4_sign"));
         assert!(registry.is_security_filter("callout_credentials"));
+        assert!(registry.is_security_filter("callout_authorization"));
         #[cfg(feature = "azure-ad-filter")]
         assert!(registry.is_security_filter("azure_ad"));
         #[cfg(feature = "gcp-adc-filter")]

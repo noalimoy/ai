@@ -27,7 +27,7 @@ use crate::{
     callout_policy::OnMissing,
     openai::{
         api_client::{ApiClient, ApiClientError, DownstreamRuntime, OutboundExecution},
-        responses::content_parts::{content_parts_mut, infer_mime_from_filename},
+        responses::content_parts::{content_parts, content_parts_mut, infer_mime_from_filename},
     },
 };
 
@@ -41,6 +41,52 @@ pub(crate) enum ReferenceSource {
     FileId(String),
     /// Remote `file_url` reference.
     FileUrl(String),
+}
+
+/// Return whether a Responses request body contains a valid `file_id` reference that
+/// will dispatch to the configured Files API.
+pub(crate) fn body_has_file_id_reference(body: &serde_json::Value) -> bool {
+    body.get("input")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| items_have_file_id_reference(items))
+}
+
+/// Return whether any supported item contains a valid `file_id` reference.
+pub(crate) fn items_have_file_id_reference(items: &[serde_json::Value]) -> bool {
+    items
+        .iter()
+        .any(|item| content_parts(item).is_some_and(|parts| parts.iter().any(has_resolvable_file_id)))
+}
+
+/// Match the same valid single-source shapes as [`resolvable_reference`] without
+/// allocating a temporary owned [`ReferenceSource`].
+fn has_resolvable_file_id(part: &serde_json::Value) -> bool {
+    match part.get("type").and_then(serde_json::Value::as_str) {
+        Some("input_image") => {
+            part.get("image_url").and_then(serde_json::Value::as_str).is_none()
+                && part.get("file_id").and_then(serde_json::Value::as_str).is_some()
+        },
+        Some("input_file") => {
+            let mut valid_sources = 0_u8;
+            let mut malformed = false;
+            let mut has_file_id = false;
+            for field in ["file_data", "file_id", "file_url"] {
+                if let Some(value) = part.get(field) {
+                    if value.is_null() {
+                        continue;
+                    }
+                    if value.as_str().is_some() {
+                        valid_sources = valid_sources.saturating_add(1);
+                        has_file_id |= field == "file_id";
+                    } else {
+                        malformed = true;
+                    }
+                }
+            }
+            !malformed && valid_sources == 1 && has_file_id
+        },
+        _ => false,
+    }
 }
 
 impl std::fmt::Display for ReferenceSource {
@@ -876,10 +922,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{
-        openai::api_client::{ApiClient, ApiClientConfig},
-        subrequest::SubRequestClient,
-    };
+    use crate::openai::api_client::{ApiClient, ApiClientConfig};
 
     #[test]
     fn infer_mime_pdf() {
@@ -1012,7 +1055,7 @@ mod tests {
     fn test_api_client(api_base_url: &str, timeout_ms: u64) -> ApiClient {
         ApiClient::new(ApiClientConfig {
             api_base_url: api_base_url.to_owned(),
-            client: SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
+            client: crate::subrequest::isolated_client(4),
             timeout: std::time::Duration::from_millis(timeout_ms),
             max_response_bytes: 1_048_576,
             forward_header_names: Vec::new(),
@@ -1585,6 +1628,47 @@ mod tests {
         assert!(
             matches!(result, Some(("input_file", ReferenceSource::FileId(id))) if id == "file-abc"),
             "file_id-only part should be classified as FileId"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one assertion per supported reference shape")]
+    fn file_id_preflight_matches_resolver_and_excludes_file_url() {
+        let file_id = serde_json::json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_file", "file_id": "file-abc"}]
+            }]
+        });
+        assert!(body_has_file_id_reference(&file_id));
+
+        let file_url = serde_json::json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_file", "file_url": "https://files.example/a"}]
+            }]
+        });
+        assert!(
+            !body_has_file_id_reference(&file_url),
+            "file_url must stay on the credential-free resolver path"
+        );
+
+        let ambiguous = serde_json::json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_file",
+                    "file_id": "file-abc",
+                    "file_url": "https://files.example/a"
+                }]
+            }]
+        });
+        assert!(
+            !body_has_file_id_reference(&ambiguous),
+            "a shape the resolver skips must not require an OGX credential"
         );
     }
 
