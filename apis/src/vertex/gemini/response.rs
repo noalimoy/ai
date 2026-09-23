@@ -666,10 +666,10 @@ fn extract_stream_content_and_tool_calls(
             text_segments.push(text);
         }
 
-        if let Some(fc) = part.get("functionCall").and_then(Value::as_object) {
-            if let Some(delta) = stream_tool_call_delta(part, fc, slots)? {
-                tool_calls.push(delta);
-            }
+        if let Some(fc) = part.get("functionCall").and_then(Value::as_object)
+            && let Some(delta) = stream_tool_call_delta(part, fc, slots)?
+        {
+            tool_calls.push(delta);
         }
     }
 
