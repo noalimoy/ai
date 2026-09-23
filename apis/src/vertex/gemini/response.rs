@@ -155,12 +155,12 @@ pub(crate) fn transform_response(body: &[u8], model: &str) -> Result<Vec<u8>, St
 
     let candidates = obj.and_then(|o| o.get("candidates")).and_then(Value::as_array);
 
-    if candidates.is_none() {
+    let Some(candidates) = candidates else {
         reject_upstream_error_frame(obj)?;
         return Err("Vertex response contained no candidates".to_owned());
-    }
+    };
 
-    let choices = convert_candidates(candidates.expect("checked above"))?;
+    let choices = convert_candidates(candidates)?;
 
     let usage = obj
         .and_then(|o| o.get("usageMetadata"))

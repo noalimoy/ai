@@ -356,7 +356,7 @@ fn convert_assistant_message(contents: &mut Vec<Value>, msg: &Value) -> Result<(
 ///
 /// Copies `extra_content.google.thought_signature` onto the Part when present
 /// (required by Gemini 3 for tool continuations). Returns `Err` when
-/// `function.arguments` is not valid JSON or not a JSON object.
+/// `function.arguments` is absent, not valid JSON, or not a JSON object.
 fn convert_tool_call(tc: &Value) -> Result<Option<Value>, String> {
     let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str) else {
         return Ok(None);
@@ -366,7 +366,7 @@ fn convert_tool_call(tc: &Value) -> Result<Option<Value>, String> {
         .get("function")
         .and_then(|f| f.get("arguments"))
         .and_then(Value::as_str)
-        .unwrap_or("{}");
+        .ok_or_else(|| "tool call is missing required field function.arguments".to_owned())?;
 
     let args: Value =
         serde_json::from_str(args_str).map_err(|e| format!("tool call arguments are not valid JSON: {e}"))?;
@@ -895,7 +895,7 @@ mod tests {
     fn tool_result_json_non_object_content_wrapped() {
         // Valid non-object JSON (array, number, etc.) must be wrapped in
         // {"result": ...} — Gemini functionResponse.response requires a Struct.
-        for (content, label) in [(r#"[1,2,3]"#, "array"), (r#"42"#, "number"), (r#"true"#, "boolean")] {
+        for (content, label) in [("[1,2,3]", "array"), ("42", "number"), ("true", "boolean")] {
             let body = format!(
                 r#"{{"model":"gemini-1.5-pro","messages":[{{"role":"tool","name":"f","content":"{content}"}}]}}"#
             );
@@ -1079,6 +1079,21 @@ mod tests {
                 "expected object type error for arguments={bad}, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn assistant_tool_call_missing_arguments_rejected() {
+        // function.arguments is absent entirely — must be rejected, not defaulted to {}.
+        let body = br#"{"model":"gemini-1.5-pro","messages":[
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_1","type":"function","function":{"name":"get_weather"}}
+            ]}
+        ]}"#;
+        let err = transform_request(body).unwrap_err();
+        assert!(
+            err.contains("function.arguments"),
+            "error should mention function.arguments for missing field: {err}"
+        );
     }
 
     #[test]

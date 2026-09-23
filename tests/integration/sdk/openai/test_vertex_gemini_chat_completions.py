@@ -746,6 +746,43 @@ class TestVertexGeminiChatCompletions:
         assert response1.choices[0].message.content == "The answer is 4."
         assert response2.choices[0].message.content == "Hello! How can I help you today?"
 
+    def test_tool_call_missing_arguments_rejected(self, vertex_proxy: int) -> None:
+        """A tool call with no function.arguments field is rejected with 400."""
+        payload = {
+            "model": "gemini-2.0-flash",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather"
+                                # arguments field intentionally absent
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "{}"},
+                {"role": "user", "content": "What now?"},
+            ],
+        }
+        resp = httpx.post(
+            f"http://127.0.0.1:{vertex_proxy}/v1/chat/completions",
+            json=payload,
+            headers={"Authorization": "Bearer not-needed"},
+            timeout=10.0,
+        )
+        assert resp.status_code == 400, (
+            f"Expected 400 for missing function.arguments, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        assert "function.arguments" in body.get("error", {}).get("message", ""), (
+            f"Error message should mention function.arguments: {body}"
+        )
+
 
 if __name__ == "__main__":
     pytest.main([__file__, *sys.argv[1:]])
