@@ -307,7 +307,7 @@ async fn store_persist_armed_survives_rehydrate_from_conversation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipeline_validates_during_cold_request_body_pre_read() {
     let (db_url, db_path) = temp_sqlite_url("rehydrate_cold_pre_read");
-    let seeded_store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
+    let seeded_store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None, None)
         .await
         .unwrap();
     seeded_store
@@ -669,6 +669,12 @@ async fn extracts_mcp_tools_from_previous_response() {
     assert_eq!(
         state.previous_tools[0]["server_url"], "http://10.0.0.5:8080/mcp",
         "server_url should be preserved for cache matching"
+    );
+    #[cfg(feature = "openai-mcp-tools")]
+    assert_eq!(
+        state.previous_tools[0][OWNER_FINGERPRINT],
+        owner_fingerprint(&crate::test_utils::test_owner("default")),
+        "cache-only listing should bind to the full trusted owner tuple"
     );
 }
 
