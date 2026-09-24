@@ -3533,6 +3533,7 @@ dependencies = [
  "praxis-proxy-filter",
  "praxis-proxy-tls",
  "quixotic-plecostomus-core",
+ "regex",
  "reqwest",
  "rmcp",
  "schemars 1.2.2",
