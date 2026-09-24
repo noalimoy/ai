@@ -278,5 +278,21 @@ def test_streaming_chat_completion(openai_client: OpenAI) -> None:
     assert usage[-1].total_tokens == 19
 
 
+def test_streaming_chat_completion_without_usage(openai_client: OpenAI) -> None:
+    stream = openai_client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": "What is the capital of France?"}],
+        stream=True,
+    )
+    chunks = list(stream)
+
+    text = "".join(chunk.choices[0].delta.content or "" for chunk in chunks if chunk.choices)
+    finish_reasons = [chunk.choices[0].finish_reason for chunk in chunks if chunk.choices]
+    usage = [chunk.usage for chunk in chunks if chunk.usage is not None]
+    assert text == "Paris is the capital of France."
+    assert "stop" in finish_reasons
+    assert usage == []
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"] + sys.argv[1:]))

@@ -23,6 +23,7 @@
 //! | `top_p`                | `inferenceConfig.topP`              |
 //! | `stop`                 | `inferenceConfig.stopSequences`     |
 //! | `stream`               | removed; determines endpoint        |
+//! | `stream_options`       | controls streaming usage output     |
 
 use std::sync::LazyLock;
 
@@ -69,6 +70,8 @@ pub(crate) struct TransformResult {
     pub model: String,
     /// Whether the original request asked for streaming output.
     pub stream: bool,
+    /// Whether the caller requested the final streaming usage chunk.
+    pub include_usage: bool,
 }
 
 // -----------------------------------------------------------------------------
@@ -76,25 +79,19 @@ pub(crate) struct TransformResult {
 // -----------------------------------------------------------------------------
 
 /// Translate an OpenAI Chat Completions request body into Bedrock Converse
-/// JSON, and return the translated bytes alongside the model name and stream
-/// flag.
+/// JSON, and return the translated bytes alongside the model and streaming
+/// options.
 ///
-/// Returns `Err(message)` when the body is not valid JSON, is not a JSON
-/// object, or is missing the required `model` field.
+/// Returns `Err(message)` when the request is malformed or cannot be
+/// represented by Bedrock Converse.
 pub(crate) fn transform_request(body: &[u8]) -> Result<TransformResult, String> {
     let value: Value = serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
 
     let obj = value.as_object().ok_or("request body is not a JSON object")?;
+    let include_usage = validate_request_semantics(obj)?;
 
-    // Extract model — required; becomes the URL path segment.
-    let model = obj
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or("missing required field `model`")?
-        .to_owned();
-    validate_model_id_for_path(&model)?;
+    let model = extract_model_id(obj)?;
 
-    // Extract stream flag before translation.
     let stream = obj.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
     let mut converse: Map<String, Value> = Map::new();
@@ -126,7 +123,102 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<TransformResult, String> 
         body: body_bytes,
         model,
         stream,
+        include_usage,
     })
+}
+
+// -----------------------------------------------------------------------------
+// Request validation
+// -----------------------------------------------------------------------------
+
+/// Validate request semantics and return whether streaming usage was requested.
+fn validate_request_semantics(obj: &Map<String, Value>) -> Result<bool, String> {
+    let include_usage = validate_stream_options(obj)?;
+
+    for (field, value) in obj {
+        if is_supported_request_field(field) || value.is_null() || is_noop_request_field(field, value) {
+            continue;
+        }
+        return Err(format!("`{field}` is not supported by the Bedrock Converse translator"));
+    }
+    Ok(include_usage)
+}
+
+/// Return whether the translator consumes a top-level request field.
+fn is_supported_request_field(field: &str) -> bool {
+    matches!(
+        field,
+        "model"
+            | "messages"
+            | "stream"
+            | "stream_options"
+            | "max_tokens"
+            | "max_completion_tokens"
+            | "temperature"
+            | "top_p"
+            | "stop"
+            | "tools"
+            | "tool_choice"
+    )
+}
+
+/// Validate streaming options and return whether usage was requested.
+fn validate_stream_options(obj: &Map<String, Value>) -> Result<bool, String> {
+    let Some(value) = obj.get("stream_options") else {
+        return Ok(false);
+    };
+    if value.is_null() {
+        return Ok(false);
+    }
+    if obj.get("stream").and_then(Value::as_bool) != Some(true) {
+        return Err("`stream_options` requires `stream: true`".to_owned());
+    }
+
+    let options = value.as_object().ok_or("`stream_options` must be an object")?;
+    let mut include_usage = false;
+    for (field, value) in options {
+        match field.as_str() {
+            "include_usage" => {
+                include_usage = value
+                    .as_bool()
+                    .ok_or("`stream_options.include_usage` must be a boolean")?;
+            },
+            other => {
+                return Err(format!(
+                    "`stream_options.{other}` is not supported by the Bedrock Converse translator"
+                ));
+            },
+        }
+    }
+
+    Ok(include_usage)
+}
+
+/// Return whether an unsupported field carries its documented no-op default.
+fn is_noop_request_field(field: &str, value: &Value) -> bool {
+    match field {
+        "n" => *value == 1,
+        "frequency_penalty" | "presence_penalty" => *value == 0.0,
+        "logprobs" | "store" => *value == false,
+        "modalities" => *value == serde_json::json!(["text"]),
+        "response_format" => *value == serde_json::json!({"type": "text"}),
+        "parallel_tool_calls" => *value == true,
+        "logit_bias" | "metadata" => value.as_object().is_some_and(Map::is_empty),
+        "service_tier" => *value == "auto",
+        "verbosity" => *value == "medium",
+        _ => false,
+    }
+}
+
+/// Extract and validate the model ID used in the upstream path.
+fn extract_model_id(obj: &Map<String, Value>) -> Result<String, String> {
+    let model = obj
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or("missing required field `model`")?
+        .to_owned();
+    validate_model_id_for_path(&model)?;
+    Ok(model)
 }
 
 /// Validate a Bedrock model ID for safe upstream path construction.
@@ -419,9 +511,8 @@ fn translate_tool_result(msg: &Value) -> Result<Value, String> {
 
 /// Build Bedrock `inferenceConfig` from Chat Completions generation params.
 ///
-/// Only parameters in the Converse base set are mapped.  Provider-specific
-/// parameters (e.g. `top_k`) are silently dropped; operators can add them
-/// via `additionalModelRequestFields` at the Bedrock gateway level.
+/// Only parameters in the Converse base set are mapped. Unsupported fields
+/// are rejected before this function is called.
 fn build_inference_config(obj: &Map<String, Value>) -> Map<String, Value> {
     let mut cfg = Map::new();
 
@@ -635,6 +726,156 @@ mod tests {
         let request = format!(r#"{{"model":"{over_limit}","messages":[]}}"#);
         let error = transform_request(request.as_bytes()).unwrap_err();
         assert!(error.contains("between 1 and 2048"));
+    }
+
+    // ── Request semantics ────────────────────────────────────────────────
+
+    #[test]
+    fn supported_request_fields_are_mapped() {
+        let body = translate(
+            r#"{"model":"m","messages":[],"max_completion_tokens":128,
+                "temperature":0.4,"top_p":0.8,"stop":["done"]}"#,
+        );
+
+        assert_eq!(body["inferenceConfig"]["maxTokens"], 128);
+        assert_eq!(body["inferenceConfig"]["temperature"], 0.4);
+        assert_eq!(body["inferenceConfig"]["topP"], 0.8);
+        assert_eq!(body["inferenceConfig"]["stopSequences"], serde_json::json!(["done"]));
+    }
+
+    #[test]
+    fn unsupported_request_semantics_are_rejected() {
+        let fields = [
+            ("n", serde_json::json!(2)),
+            ("response_format", serde_json::json!({"type": "json_object"})),
+            ("frequency_penalty", serde_json::json!(0.5)),
+            ("presence_penalty", serde_json::json!(-0.5)),
+            ("logprobs", serde_json::json!(true)),
+            ("top_logprobs", serde_json::json!(2)),
+            ("seed", serde_json::json!(42)),
+            ("parallel_tool_calls", serde_json::json!(false)),
+            ("store", serde_json::json!(true)),
+            ("modalities", serde_json::json!(["text", "audio"])),
+            ("logit_bias", serde_json::json!({"42": 1})),
+            ("reasoning_effort", serde_json::json!("high")),
+            ("verbosity", serde_json::json!("low")),
+            ("prediction", serde_json::json!({"type": "content", "content": "x"})),
+            ("top_k", serde_json::json!(40)),
+        ];
+
+        for (field, value) in fields {
+            let request = serde_json::json!({
+                "model": "m",
+                "messages": [],
+                field: value,
+            });
+            let error = transform_request(request.to_string().as_bytes()).unwrap_err();
+            assert!(error.contains(field), "rejection must name `{field}`: {error}");
+        }
+    }
+
+    #[test]
+    fn unsupported_noop_defaults_are_accepted() {
+        let request = serde_json::json!({
+            "model": "m",
+            "messages": [],
+            "n": 1,
+            "frequency_penalty": 0,
+            "presence_penalty": 0,
+            "logprobs": false,
+            "store": false,
+            "modalities": ["text"],
+            "response_format": {"type": "text"},
+            "parallel_tool_calls": true,
+            "logit_bias": {},
+            "metadata": {},
+            "service_tier": "auto",
+            "verbosity": "medium",
+            "seed": null,
+        });
+
+        assert!(transform_request(request.to_string().as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn stream_usage_option_is_supported_for_streaming_requests() {
+        let request = serde_json::json!({
+            "model": "m",
+            "messages": [],
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        });
+
+        let result = transform_request(request.to_string().as_bytes()).unwrap();
+        assert!(result.stream);
+        assert!(result.include_usage);
+    }
+
+    #[test]
+    fn stream_usage_false_and_omitted_are_disabled() {
+        for stream_options in [None, Some(serde_json::json!({"include_usage": false}))] {
+            let mut request = serde_json::json!({
+                "model": "m",
+                "messages": [],
+                "stream": true,
+            });
+            if let Some(options) = stream_options {
+                request["stream_options"] = options;
+            }
+
+            let result = transform_request(request.to_string().as_bytes()).unwrap();
+            assert!(!result.include_usage);
+        }
+    }
+
+    #[test]
+    fn stream_usage_option_requires_streaming() {
+        let request = serde_json::json!({
+            "model": "m",
+            "messages": [],
+            "stream_options": {"include_usage": true},
+        });
+
+        let error = transform_request(request.to_string().as_bytes()).unwrap_err();
+        assert!(error.contains("stream_options"));
+    }
+
+    #[test]
+    fn unsupported_stream_option_is_rejected_explicitly() {
+        let request = serde_json::json!({
+            "model": "m",
+            "messages": [],
+            "stream": true,
+            "stream_options": {"include_obfuscation": true},
+        });
+
+        let error = transform_request(request.to_string().as_bytes()).unwrap_err();
+        assert!(error.contains("stream_options.include_obfuscation"));
+    }
+
+    #[test]
+    fn stream_usage_option_requires_a_boolean() {
+        let request = serde_json::json!({
+            "model": "m",
+            "messages": [],
+            "stream": true,
+            "stream_options": {"include_usage": "true"},
+        });
+
+        let error = transform_request(request.to_string().as_bytes()).unwrap_err();
+        assert!(error.contains("stream_options.include_usage"));
+    }
+
+    #[test]
+    fn reasoning_effort_medium_is_not_a_noop() {
+        let request = serde_json::json!({
+            "model": "m",
+            "messages": [],
+            "reasoning_effort": "medium",
+        });
+
+        let error = transform_request(request.to_string().as_bytes()).unwrap_err();
+        assert!(error.contains("reasoning_effort"));
     }
 
     // ── Stream flag ───────────────────────────────────────────────────────
