@@ -678,6 +678,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsafe_model_does_not_rewrite_upstream_path() {
+        let filter = make_filter("{}");
+        let req = make_request(Method::POST, "/v1/chat/completions");
+        let mut ctx = make_filter_context(&req);
+        let mut body = Some(chat_body("../../../other-endpoint", false));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Reject(r) if r.status == 400));
+        assert!(
+            ctx.rewritten_path.is_none(),
+            "invalid model must not set an upstream path"
+        );
+        assert!(
+            ctx.get_metadata(MODEL_KEY).is_none(),
+            "invalid model must not be persisted"
+        );
+    }
+
+    #[tokio::test]
     async fn empty_request_body_returns_openai_400() {
         let filter = make_filter("{}");
         let req = make_request(Method::POST, "/v1/chat/completions");

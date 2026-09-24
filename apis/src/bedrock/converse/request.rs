@@ -24,7 +24,36 @@
 //! | `stop`                 | `inferenceConfig.stopSequences`     |
 //! | `stream`               | removed; determines endpoint        |
 
+use std::sync::LazyLock;
+
+use regex::Regex;
 use serde_json::{Map, Value};
+
+/// Maximum Bedrock model ID length.
+const MAX_MODEL_ID_LEN: usize = 2048;
+
+/// Bedrock Converse `modelId` pattern.
+const MODEL_ID_PATTERN: &str = concat!(
+    r"\A(?:",
+    r"arn:aws(?:-[a-z0-9-]+)?:bedrock:[a-z0-9-]{1,20}:(?:",
+    r"[0-9]{12}:custom-model/[a-z0-9-]{1,63}\.[a-z0-9-]{1,63}/[a-z0-9]{12}|",
+    r":foundation-model/[a-z0-9-]{1,63}\.[a-z0-9-]{1,63}(?:[.:]?[a-z0-9-]{1,63})|",
+    r"[0-9]{12}:imported-model/[a-z0-9]{12}|",
+    r"[0-9]{12}:provisioned-model/[a-z0-9]{12}|",
+    r"[0-9]{12}:custom-model-deployment/[a-z0-9]{12}|",
+    r"[0-9]{12}:(?:inference-profile|application-inference-profile)/[a-zA-Z0-9-:.]+",
+    r")|",
+    r"[a-z0-9-]{1,63}\.[a-z0-9-]{1,63}(?:[.:]?[a-z0-9-]{1,63})|",
+    r"(?:[0-9a-zA-Z][_-]?)+|",
+    r"[a-zA-Z0-9-:.]+|",
+    r"arn:aws(?:-[a-z0-9-]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:prompt/[0-9a-zA-Z]{10}(?::[0-9]{1,5})?|",
+    r"arn:aws:sagemaker:[a-z0-9-]+:[0-9]{12}:endpoint/[a-zA-Z0-9-]+|",
+    r"arn:aws(?:-[a-z0-9-]+)?:bedrock:[0-9a-z-]{1,20}:[0-9]{12}:(?:default-)?prompt-router/[a-zA-Z0-9-:.]+",
+    r")\z",
+);
+
+/// Compiled Bedrock model ID pattern.
+static MODEL_ID_REGEX: LazyLock<Result<Regex, regex::Error>> = LazyLock::new(|| Regex::new(MODEL_ID_PATTERN));
 
 // -----------------------------------------------------------------------------
 // Public result type
@@ -63,6 +92,7 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<TransformResult, String> 
         .and_then(Value::as_str)
         .ok_or("missing required field `model`")?
         .to_owned();
+    validate_model_id_for_path(&model)?;
 
     // Extract stream flag before translation.
     let stream = obj.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -97,6 +127,24 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<TransformResult, String> 
         model,
         stream,
     })
+}
+
+/// Validate a Bedrock model ID for safe upstream path construction.
+fn validate_model_id_for_path(model: &str) -> Result<(), String> {
+    if model.is_empty() || model.len() > MAX_MODEL_ID_LEN {
+        return Err(format!(
+            "field `model` must be between 1 and {MAX_MODEL_ID_LEN} characters"
+        ));
+    }
+
+    let pattern = MODEL_ID_REGEX
+        .as_ref()
+        .map_err(|_error| "Bedrock model ID validation is unavailable".to_owned())?;
+    if !pattern.is_match(model) {
+        return Err("field `model` is not a valid Bedrock model ID".to_owned());
+    }
+
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -525,6 +573,68 @@ mod tests {
     fn missing_model_returns_error() {
         let err = transform_request(br#"{"messages":[]}"#).unwrap_err();
         assert!(err.contains("model"), "error must mention `model`");
+    }
+
+    #[test]
+    fn valid_model_id_forms_are_accepted() {
+        let models = [
+            "anthropic.claude-3-sonnet-20240229-v1:0",
+            "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-v2",
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/profile.name:1",
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/profile.name:1",
+            "arn:aws:bedrock:us-east-1:123456789012:custom-model/name.name/abcdefghijkl",
+            "arn:aws:bedrock:us-east-1:123456789012:imported-model/abcdefghijkl",
+            "arn:aws:bedrock:us-east-1:123456789012:provisioned-model/abcdefghijkl",
+            "arn:aws:bedrock:us-east-1:123456789012:custom-model-deployment/abcdefghijkl",
+            "arn:aws:bedrock:us-east-1:123456789012:prompt/abcdefghij:123",
+            "arn:aws:bedrock:us-east-1:123456789012:default-prompt-router/router.name:1",
+            "arn:aws-us-gov:bedrock:us-gov-west-1:123456789012:prompt/abcdefghij",
+            "arn:aws:sagemaker:us-east-1:123456789012:endpoint/my-endpoint",
+        ];
+
+        for model in models {
+            let request = format!(r#"{{"model":"{model}","messages":[]}}"#);
+            assert_eq!(transform_request(request.as_bytes()).unwrap().model, model);
+        }
+    }
+
+    #[test]
+    fn unsafe_model_ids_are_rejected() {
+        let models = [
+            "",
+            "../../../other-endpoint",
+            "model?target=other",
+            "model#fragment",
+            "model%2Fother",
+            "model/other",
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/../other",
+            "arn:aws:bedrock:us-east-1:123456789012:unknown-resource/abcdefghijkl",
+            "arn:aws:bedrock:us-east-1:123:provisioned-model/abcdefghijkl",
+            "arn:aws:sagemaker:us-east-1:123456789012:endpoint/my_endpoint",
+            "arn:aws-?:bedrock:us-east-1::foundation-model/anthropic.claude-v2",
+            "arn:aws-#:bedrock:us-east-1::foundation-model/anthropic.claude-v2",
+            "arn:aws-%2f:bedrock:us-east-1::foundation-model/anthropic.claude-v2",
+            "arn:aws-../..:bedrock:us-east-1::foundation-model/anthropic.claude-v2",
+        ];
+
+        for model in models {
+            let request = format!(r#"{{"model":"{model}","messages":[]}}"#);
+            let error = transform_request(request.as_bytes()).unwrap_err();
+            assert!(error.contains("model"), "unexpected error for {model}: {error}");
+        }
+    }
+
+    #[test]
+    fn model_id_length_is_validated() {
+        let maximum = "a".repeat(MAX_MODEL_ID_LEN);
+        let request = format!(r#"{{"model":"{maximum}","messages":[]}}"#);
+        assert_eq!(transform_request(request.as_bytes()).unwrap().model, maximum);
+
+        let over_limit = "a".repeat(MAX_MODEL_ID_LEN + 1);
+        let request = format!(r#"{{"model":"{over_limit}","messages":[]}}"#);
+        let error = transform_request(request.as_bytes()).unwrap_err();
+        assert!(error.contains("between 1 and 2048"));
     }
 
     // ── Stream flag ───────────────────────────────────────────────────────
