@@ -398,18 +398,11 @@ fn convert_finish_reason(reason: Option<&str>, has_tool_calls: bool) -> &'static
         // Blocked/safety reasons always win — never report a blocked call as
         // a successfully executable "tool_calls".
         Some(
-            "SAFETY"
-            | "RECITATION"
-            | "BLOCKLIST"
-            | "PROHIBITED_CONTENT"
-            | "SPII"
-            | "IMAGE_SAFETY"
-            | "LANGUAGE"
-            | "OTHER"
-            | "MODEL_ARMOR",
+            "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "IMAGE_SAFETY" | "LANGUAGE"
+            | "OTHER" | "MODEL_ARMOR",
         ) => "content_filter",
         // MALFORMED_FUNCTION_CALL means the model attempted a tool call but
-        // produced invalid arguments. It is not a content safety block, so
+        // produced invalid function call. It is not a content safety block, so
         // it maps to "stop" rather than "content_filter". It still wins over
         // has_tool_calls so the client is never told to execute a bad call.
         Some("MALFORMED_FUNCTION_CALL") => "stop",
