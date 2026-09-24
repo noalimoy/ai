@@ -207,19 +207,7 @@ fn convert_messages(obj: &Map<String, Value>) -> Result<(Vec<Value>, Option<Valu
     let mut system_parts = Vec::new();
 
     for (i, msg) in messages.iter().enumerate() {
-        let Some(role) = msg.get("role").and_then(Value::as_str) else {
-            continue;
-        };
-
-        match role {
-            "system" | "developer" => collect_system_parts(&mut system_parts, msg),
-            "user" => convert_user_message(&mut contents, msg),
-            "assistant" => convert_assistant_message(&mut contents, msg)?,
-            "tool" | "function" => convert_tool_result(&mut contents, messages, i, msg),
-            _ => {
-                warn!(role, "dropping message with unknown role");
-            },
-        }
+        convert_one_message(&mut contents, &mut system_parts, messages, i, msg)?;
     }
 
     let system_instruction = if system_parts.is_empty() {
@@ -229,6 +217,29 @@ fn convert_messages(obj: &Map<String, Value>) -> Result<(Vec<Value>, Option<Valu
     };
 
     Ok((contents, system_instruction))
+}
+
+/// Translate a single OpenAI message into `contents` or `system_parts`.
+fn convert_one_message(
+    contents: &mut Vec<Value>,
+    system_parts: &mut Vec<Value>,
+    messages: &[Value],
+    i: usize,
+    msg: &Value,
+) -> Result<(), String> {
+    let Some(role) = msg.get("role").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    match role {
+        "system" | "developer" => collect_system_parts(system_parts, msg),
+        "user" => convert_user_message(contents, msg),
+        "assistant" => convert_assistant_message(contents, msg)?,
+        "tool" | "function" => {
+            convert_tool_result(contents, messages, i, msg, is_tool_result_continuation(messages, i));
+        },
+        _ => warn!(role, "dropping message with unknown role"),
+    }
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -459,6 +470,16 @@ fn json_kind(v: &Value) -> &'static str {
 // Tool Result Messages
 // -----------------------------------------------------------------------------
 
+/// Returns `true` when `messages[index - 1]` is also a `tool`/`function` result.
+fn is_tool_result_continuation(messages: &[Value], index: usize) -> bool {
+    index > 0
+        && messages
+            .get(index - 1)
+            .and_then(|m| m.get("role"))
+            .and_then(Value::as_str)
+            .is_some_and(|r| r == "tool" || r == "function")
+}
+
 /// Convert a `tool` or `function` role message to a Gemini
 /// `functionResponse` part.
 ///
@@ -467,7 +488,10 @@ fn json_kind(v: &Value) -> &'static str {
 ///    convenience
 /// 2. `tool_call_id` → nearest preceding assistant `tool_calls` entry with that id
 /// 3. Fallback to `"unknown"` with a warning (Gemini will likely reject this with 400)
-fn convert_tool_result(contents: &mut Vec<Value>, messages: &[Value], index: usize, msg: &Value) {
+///
+/// When `append_to_last` is `true`, the part is appended to the last `contents`
+/// entry rather than opening a new `user` turn (required for parallel tool calls).
+fn convert_tool_result(contents: &mut Vec<Value>, messages: &[Value], index: usize, msg: &Value, append_to_last: bool) {
     let name = resolve_tool_function_name(messages, index, msg);
 
     let content = tool_result_content(msg.get("content"));
@@ -479,14 +503,24 @@ fn convert_tool_result(contents: &mut Vec<Value>, messages: &[Value], index: usi
         _ => json!({ "result": content.as_ref() }),
     };
 
+    let part = json!({
+        "functionResponse": {
+            "name": name,
+            "response": response,
+        }
+    });
+
+    if append_to_last
+        && let Some(last) = contents.last_mut()
+        && let Some(Value::Array(parts)) = last.get_mut("parts")
+    {
+        parts.push(part);
+        return;
+    }
+
     contents.push(json!({
         "role": "user",
-        "parts": [{
-            "functionResponse": {
-                "name": name,
-                "response": response,
-            }
-        }]
+        "parts": [part]
     }));
 }
 
@@ -981,6 +1015,75 @@ mod tests {
         assert_eq!(weather["response"]["temp"], 72);
         assert_eq!(calendar["name"], "get_calendar");
         assert_eq!(calendar["response"]["event"], "standup");
+    }
+
+    #[test]
+    fn parallel_tool_results_grouped_into_one_user_turn() {
+        // Google requires all parallel function responses from a single
+        // assistant turn to be sent inside one `user` content block with
+        // multiple `functionResponse` parts.  Emitting separate blocks
+        // triggers a 400 from the Gemini API.
+        let body = br#"{"model":"gemini-2.0-flash","messages":[
+            {"role":"user","content":"What is the weather and time?"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_w","type":"function","function":{"name":"get_weather","arguments":"{}"}},
+                {"id":"call_t","type":"function","function":{"name":"get_time","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"call_w","content":"{\"temp\":72}"},
+            {"role":"tool","tool_call_id":"call_t","content":"{\"time\":\"14:00\"}"}
+        ]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
+
+        let contents = parsed["contents"].as_array().unwrap();
+        // user(1) + model(1) + user-with-both-responses(1) = 3 total
+        assert_eq!(
+            contents.len(),
+            3,
+            "parallel tool results must be merged into a single user turn, got: {contents:?}"
+        );
+
+        let tool_turn = &contents[2];
+        assert_eq!(tool_turn["role"], "user");
+        let parts = tool_turn["parts"].as_array().unwrap();
+        assert_eq!(
+            parts.len(),
+            2,
+            "both functionResponse parts must live in the same user content block"
+        );
+        assert_eq!(parts[0]["functionResponse"]["name"], "get_weather");
+        assert_eq!(parts[0]["functionResponse"]["response"]["temp"], 72);
+        assert_eq!(parts[1]["functionResponse"]["name"], "get_time");
+        assert_eq!(parts[1]["functionResponse"]["response"]["time"], "14:00");
+    }
+
+    #[test]
+    fn sequential_tool_rounds_are_not_merged() {
+        // Two separate assistant→tool round-trips must NOT be merged: each
+        // set of responses belongs to a different assistant turn.
+        let body = br#"{"model":"gemini-2.0-flash","messages":[
+            {"role":"user","content":"first"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_a","type":"function","function":{"name":"fn_a","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"call_a","content":"{\"a\":1}"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_b","type":"function","function":{"name":"fn_b","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"call_b","content":"{\"b\":2}"}
+        ]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
+
+        let contents = parsed["contents"].as_array().unwrap();
+        // user + model + user(tool_a) + model + user(tool_b) = 5
+        assert_eq!(
+            contents.len(),
+            5,
+            "sequential tool rounds must produce separate user turns, got: {contents:?}"
+        );
+        assert_eq!(contents[2]["parts"][0]["functionResponse"]["name"], "fn_a");
+        assert_eq!(contents[4]["parts"][0]["functionResponse"]["name"], "fn_b");
     }
 
     #[test]
