@@ -11,7 +11,6 @@
 
 pub mod anthropic;
 pub mod azure;
-mod callout_authorization;
 mod callout_credentials;
 pub mod callout_headers;
 mod callout_identity;
@@ -25,9 +24,9 @@ pub mod json_body;
 pub(crate) mod mcp_client;
 pub mod openai;
 pub mod operation;
+mod project_state_owner_headers;
 pub mod promotion;
 mod state_owner;
-mod state_owner_headers;
 #[cfg(feature = "store")]
 pub mod store;
 pub mod subrequest;
@@ -35,10 +34,9 @@ pub mod token_cache;
 pub mod vertex;
 pub(crate) mod web_search;
 
-pub use callout_authorization::{CalloutAuthorization, CalloutAuthorizationFilter};
 pub use callout_credentials::{CalloutCredentials, CalloutCredentialsFilter};
+pub use project_state_owner_headers::ProjectStateOwnerHeadersFilter;
 pub use state_owner::{StateOwner, StateOwnerError, StateOwnerFilter, project_state_owner};
-pub use state_owner_headers::StateOwnerHeadersFilter;
 
 /// Whether a `Content-Type` header value indicates `text/event-stream`,
 /// ignoring parameters (e.g. `; charset=utf-8`) and ASCII case.
@@ -192,7 +190,7 @@ pub(crate) mod test_utils {
         );
         praxis_filter::register_filters!(
             @register registry,
-            http "state_owner_headers" => crate::StateOwnerHeadersFilter::from_config
+            http "project_state_owner_headers" => crate::ProjectStateOwnerHeadersFilter::from_config
         );
         praxis_filter::register_filters!(
             @register registry,
