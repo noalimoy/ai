@@ -188,13 +188,33 @@ fn translate_messages(obj: &Map<String, Value>) -> Result<Vec<Value>, String> {
                 }));
             },
             "tool" => {
-                // Bedrock places tool results in a user-role message
-                // with a `toolResult` content block.
-                let content = translate_tool_result(msg)?;
-                out.push(serde_json::json!({
-                    "role": "user",
-                    "content": content
-                }));
+                // Bedrock requires tool results inside a user-role message.
+                // Merge consecutive tool messages into one to preserve the
+                // required user/assistant role alternation.
+                let block = translate_tool_result(msg)?;
+                // Immutable check first so the borrow ends before the
+                // mutable access or push below.
+                let merge = out.last().is_some_and(|last| {
+                    last.get("role").and_then(Value::as_str) == Some("user")
+                        && last
+                            .get("content")
+                            .and_then(Value::as_array)
+                            .is_some_and(|c| c.iter().all(|b| b.get("toolResult").is_some()))
+                });
+                if merge {
+                    if let Some(arr) = out
+                        .last_mut()
+                        .and_then(|m| m.get_mut("content"))
+                        .and_then(Value::as_array_mut)
+                    {
+                        arr.push(block);
+                    }
+                } else {
+                    out.push(serde_json::json!({
+                        "role": "user",
+                        "content": [block]
+                    }));
+                }
             },
             other => return Err(format!("unsupported message role `{other}`")),
         }
@@ -317,12 +337,11 @@ fn translate_assistant_content(msg: &Value) -> Result<Vec<Value>, String> {
     Ok(blocks)
 }
 
-/// Translate a `tool` role message into a Bedrock `toolResult` content block
-/// inside a `user` role message.
+/// Translate a `tool` role message into a Bedrock `toolResult` content block.
 ///
-/// Chat Completions `tool` messages identify the call by `tool_call_id`.
-/// Bedrock `toolResult` uses the same identifier as `toolUseId`.
-fn translate_tool_result(msg: &Value) -> Result<Vec<Value>, String> {
+/// Returns a single `{"toolResult": {...}}` block; the caller places it into
+/// a `user`-role message, merging with adjacent blocks when appropriate.
+fn translate_tool_result(msg: &Value) -> Result<Value, String> {
     let tool_use_id = msg
         .get("tool_call_id")
         .and_then(Value::as_str)
@@ -338,12 +357,12 @@ fn translate_tool_result(msg: &Value) -> Result<Vec<Value>, String> {
         _ => vec![serde_json::json!({"text": ""})],
     };
 
-    Ok(vec![serde_json::json!({
+    Ok(serde_json::json!({
         "toolResult": {
             "toolUseId": tool_use_id,
             "content": content_block
         }
-    })])
+    }))
 }
 
 // -----------------------------------------------------------------------------
@@ -693,6 +712,134 @@ mod tests {
         let tr = &msg["content"][0]["toolResult"];
         assert_eq!(tr["toolUseId"], "call_abc");
         assert_eq!(tr["content"][0]["text"], "{\"temp\":18}");
+    }
+
+    /// A `tool` message following a plain `user` message must produce a new
+    /// `user` message rather than appending its `toolResult` block to the
+    /// preceding one (which contains only text, not `toolResult` blocks).
+    #[test]
+    fn tool_message_after_plain_user_is_not_merged() {
+        let body = translate(
+            r#"{"model":"m","messages":[
+                {"role":"user","content":"here is some context"},
+                {"role":"tool","tool_call_id":"t1","content":"result"}
+            ]}"#,
+        );
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs.len(),
+            2,
+            "tool result must not be merged into the preceding plain user message"
+        );
+        assert_eq!(msgs[0]["content"][0]["text"], "here is some context");
+        assert!(msgs[1]["content"][0].get("toolResult").is_some());
+    }
+
+    /// Parallel tool calls produce multiple back-to-back `tool` messages.
+    /// They must be merged into a single Bedrock `user` message so the output
+    /// sequence maintains strict user/assistant alternation.
+    #[test]
+    fn consecutive_tool_messages_merged_into_single_user_message() {
+        let body = translate(
+            r#"{"model":"m","messages":[
+                {"role":"user","content":"What's the weather in Paris and London?"},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"c1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}},
+                    {"id":"c2","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"London\"}"}}
+                ]},
+                {"role":"tool","tool_call_id":"c1","content":"sunny"},
+                {"role":"tool","tool_call_id":"c2","content":"rainy"}
+            ]}"#,
+        );
+        let msgs = body["messages"].as_array().unwrap();
+        // Expected output: user / assistant / user — three messages, strict alternation.
+        assert_eq!(
+            msgs.len(),
+            3,
+            "consecutive tool messages must collapse into one user message"
+        );
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[2]["role"], "user");
+
+        let content = msgs[2]["content"].as_array().unwrap();
+        assert_eq!(
+            content.len(),
+            2,
+            "both toolResult blocks must appear in one content array"
+        );
+        assert_eq!(content[0]["toolResult"]["toolUseId"], "c1");
+        assert_eq!(content[1]["toolResult"]["toolUseId"], "c2");
+    }
+
+    /// `toolResult` blocks must appear in the same order as their source `tool`
+    /// messages; content values must be preserved.
+    #[test]
+    fn consecutive_tool_messages_preserve_order() {
+        let body = translate(
+            r#"{"model":"m","messages":[
+                {"role":"user","content":"go"},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"t1","type":"function","function":{"name":"a","arguments":"{}"}},
+                    {"id":"t2","type":"function","function":{"name":"b","arguments":"{}"}},
+                    {"id":"t3","type":"function","function":{"name":"c","arguments":"{}"}}
+                ]},
+                {"role":"tool","tool_call_id":"t1","content":"first"},
+                {"role":"tool","tool_call_id":"t2","content":"second"},
+                {"role":"tool","tool_call_id":"t3","content":"third"}
+            ]}"#,
+        );
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[2]["role"], "user");
+
+        let content = msgs[2]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["toolResult"]["toolUseId"], "t1");
+        assert_eq!(content[1]["toolResult"]["toolUseId"], "t2");
+        assert_eq!(content[2]["toolResult"]["toolUseId"], "t3");
+        assert_eq!(content[0]["toolResult"]["content"][0]["text"], "first");
+        assert_eq!(content[1]["toolResult"]["content"][0]["text"], "second");
+        assert_eq!(content[2]["toolResult"]["content"][0]["text"], "third");
+    }
+
+    /// Tool results from separate agentic rounds (each preceded by its own
+    /// assistant message) must not be merged.  The input uses a realistic
+    /// two-round sequence: the assistant returns one result, replies, then
+    /// issues a second tool call.
+    #[test]
+    fn non_consecutive_tool_messages_not_merged() {
+        // Input:  user → assistant(x1) → tool(x1) → assistant(reply + x2) → tool(x2)
+        // Output: user / assistant / user(x1) / assistant / user(x2) — five messages.
+        let body = translate(
+            r#"{"model":"m","messages":[
+                {"role":"user","content":"start"},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"x1","type":"function","function":{"name":"f","arguments":"{}"}}
+                ]},
+                {"role":"tool","tool_call_id":"x1","content":"result-one"},
+                {"role":"assistant","content":"Got it, now let me also check…","tool_calls":[
+                    {"id":"x2","type":"function","function":{"name":"g","arguments":"{}"}}
+                ]},
+                {"role":"tool","tool_call_id":"x2","content":"result-two"}
+            ]}"#,
+        );
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 5);
+
+        // Verify strict alternation.
+        for (i, expected) in ["user", "assistant", "user", "assistant", "user"].iter().enumerate() {
+            assert_eq!(msgs[i]["role"], *expected, "role mismatch at index {i}");
+        }
+
+        // Each tool round produces its own user message with exactly one block.
+        let first_result = &msgs[2];
+        assert_eq!(first_result["content"].as_array().unwrap().len(), 1);
+        assert_eq!(first_result["content"][0]["toolResult"]["toolUseId"], "x1");
+
+        let second_result = &msgs[4];
+        assert_eq!(second_result["content"].as_array().unwrap().len(), 1);
+        assert_eq!(second_result["content"][0]["toolResult"]["toolUseId"], "x2");
     }
 
     // ── Inference config ──────────────────────────────────────────────────
