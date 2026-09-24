@@ -69,6 +69,9 @@ const MODEL_KEY: &str = "bedrock_converse.model";
 /// streaming chunks so each SSE frame carries the same `id` field.
 const RESPONSE_ID_KEY: &str = "bedrock_converse.response_id";
 
+/// Whether the caller requested streaming usage metadata.
+const INCLUDE_USAGE_KEY: &str = "bedrock_converse.include_usage";
+
 /// Discriminates which `on_response_body` branch to execute.
 const RESPONSE_PATH_KEY: &str = "bedrock_converse.response_path";
 /// Response-path variant for upstream error responses.
@@ -214,6 +217,7 @@ impl HttpFilter for OpenaiChatCompletionsToBedrockConverseFilter {
 
         // Persist model name for the response phase.
         ctx.set_metadata(MODEL_KEY, result.model.clone());
+        ctx.set_metadata(INCLUDE_USAGE_KEY, result.include_usage.to_string());
 
         // Generate a stable response ID used by all streaming SSE frames.
         let response_id = format!("chatcmpl-{:x}", response_id_seed());
@@ -397,6 +401,7 @@ fn translate_stream_chunk(
         .get_metadata(RESPONSE_ID_KEY)
         .unwrap_or(response::FALLBACK_ID)
         .to_owned();
+    let include_usage = ctx.get_metadata(INCLUDE_USAGE_KEY) == Some("true");
 
     let chunk = body.take().unwrap_or_default();
 
@@ -422,6 +427,9 @@ fn translate_stream_chunk(
                 for msg in &messages {
                     if msg.is_exception() {
                         state.failed = true;
+                    }
+                    if msg.event_type() == Some("metadata") && !include_usage {
+                        continue;
                     }
                     if let Some(json_bytes) = transform_stream_event(msg, &model, &response_id, &mut state.stream_state)
                     {
@@ -637,7 +645,9 @@ mod tests {
         let mut ctx = make_filter_context(&req);
         ctx.current_filter_id = Some(0);
 
-        let mut body = Some(chat_body("anthropic.claude-3-sonnet-20240229-v1:0", true));
+        let mut body = Some(Bytes::from_static(
+            br#"{"model":"anthropic.claude-3-sonnet-20240229-v1:0","messages":[],"stream":true,"stream_options":{"include_usage":true}}"#,
+        ));
         filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
         assert_eq!(
@@ -645,6 +655,7 @@ mod tests {
             Some("/model/anthropic.claude-3-sonnet-20240229-v1:0/converse-stream"),
             "streaming path must end in /converse-stream"
         );
+        assert_eq!(ctx.get_metadata(INCLUDE_USAGE_KEY), Some("true"));
     }
 
     #[tokio::test]
@@ -695,6 +706,24 @@ mod tests {
             ctx.get_metadata(MODEL_KEY).is_none(),
             "invalid model must not be persisted"
         );
+    }
+
+    #[tokio::test]
+    async fn unsupported_request_field_returns_openai_400() {
+        let filter = make_filter("{}");
+        let req = make_request(Method::POST, "/v1/chat/completions");
+        let mut ctx = make_filter_context(&req);
+        let mut body = Some(Bytes::from_static(br#"{"model":"m","messages":[],"n":2}"#));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        let FilterAction::Reject(rejection) = action else {
+            panic!("unsupported request semantics must be rejected");
+        };
+        assert_eq!(rejection.status, 400);
+        let error: Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+        assert_eq!(error["error"]["code"], "invalid_request");
+        assert!(error["error"]["message"].as_str().unwrap().contains("`n`"));
     }
 
     #[tokio::test]
@@ -828,6 +857,7 @@ mod tests {
         ctx.set_metadata(RESPONSE_PATH_KEY, RESPONSE_PATH_STREAM);
         ctx.set_metadata(MODEL_KEY, "amazon.nova-lite-v1:0");
         ctx.set_metadata(RESPONSE_ID_KEY, "chatcmpl-test");
+        ctx.set_metadata(INCLUDE_USAGE_KEY, "true");
 
         // Frame 1: messageStart
         let start_frame = event_stream_frame("messageStart", br#"{"role":"assistant"}"#);
@@ -838,11 +868,17 @@ mod tests {
         );
         // Frame 3: messageStop
         let stop_frame = event_stream_frame("messageStop", br#"{"stopReason":"end_turn"}"#);
+        // Frame 4: metadata
+        let metadata_frame = event_stream_frame(
+            "metadata",
+            br#"{"usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15}}"#,
+        );
 
         // Deliver all frames in a single chunk (common case).
         let mut combined = start_frame;
         combined.extend_from_slice(&delta_frame);
         combined.extend_from_slice(&stop_frame);
+        combined.extend_from_slice(&metadata_frame);
 
         let mut body = Some(Bytes::from(combined));
         filter.on_response_body(&mut ctx, &mut body, true).unwrap();
@@ -856,6 +892,38 @@ mod tests {
         assert!(text.ends_with("data: [DONE]\n\n"), "must end with [DONE] sentinel");
         // Text delta must be present.
         assert!(text.contains("Hi!"), "text delta must appear in output");
+        assert!(text.contains("\"total_tokens\":15"), "requested usage must appear");
+    }
+
+    #[test]
+    fn on_response_body_stream_suppresses_usage_without_opt_in() {
+        for include_usage in [None, Some("false")] {
+            let filter = make_filter("{}");
+            let req = make_request(Method::POST, "/v1/chat/completions");
+            let mut ctx = make_filter_context(&req);
+            ctx.current_filter_id = Some(0);
+            ctx.set_metadata(RESPONSE_PATH_KEY, RESPONSE_PATH_STREAM);
+            ctx.set_metadata(MODEL_KEY, "amazon.nova-lite-v1:0");
+            ctx.set_metadata(RESPONSE_ID_KEY, "chatcmpl-test");
+            if let Some(value) = include_usage {
+                ctx.set_metadata(INCLUDE_USAGE_KEY, value);
+            }
+
+            let mut combined = event_stream_frame("messageStart", br#"{"role":"assistant"}"#);
+            combined.extend_from_slice(&event_stream_frame("messageStop", br#"{"stopReason":"end_turn"}"#));
+            combined.extend_from_slice(&event_stream_frame(
+                "metadata",
+                br#"{"usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15}}"#,
+            ));
+
+            let mut body = Some(Bytes::from(combined));
+            filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+            let output = body.unwrap();
+            let text = std::str::from_utf8(&output).unwrap();
+            assert!(!text.contains("\"usage\""));
+            assert!(text.ends_with("data: [DONE]\n\n"));
+        }
     }
 
     #[test]
