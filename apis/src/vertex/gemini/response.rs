@@ -47,11 +47,12 @@ pub(crate) struct StreamTranslateState {
     /// chunk with `choices: []`, so this is stashed rather than emitted
     /// inline.
     usage: Option<Value>,
-    /// Set when any candidate in any frame has carried a non-null `finishReason`.
-    /// A stream that closes without one is treated as truncated. With `n > 1`,
-    /// any single candidate's `finishReason` satisfies the check; per-candidate
-    /// tracking is not implemented.
-    saw_finish_reason: bool,
+    /// Candidate indices that have carried a non-null `finishReason`.
+    finished_candidates: BTreeSet<u64>,
+    /// Candidate indices observed anywhere in the stream.
+    seen_candidates: BTreeSet<u64>,
+    /// Number of candidates requested through OpenAI's `n` parameter.
+    expected_candidate_count: u64,
 }
 
 /// One OpenAI `tool_calls[]` entry assembled across Gemini SSE frames.
@@ -86,13 +87,27 @@ impl StreamTranslateState {
             started_candidates: BTreeSet::new(),
             include_usage: false,
             usage: None,
-            saw_finish_reason: false,
+            finished_candidates: BTreeSet::new(),
+            seen_candidates: BTreeSet::new(),
+            expected_candidate_count: 1,
         }
     }
 
-    /// Returns `true` once any frame has carried `finishReason` on any candidate.
-    pub(crate) fn saw_finish_reason(&self) -> bool {
-        self.saw_finish_reason
+    /// Return whether every observed and requested candidate finished.
+    ///
+    /// When Vertex caps the candidate count below the requested `n`, the
+    /// stream is treated as truncated and the client receives an error.
+    /// This is intentional: a partial response with no explicit Vertex
+    /// acknowledgement is indistinguishable from a truncated connection.
+    pub(crate) fn is_complete(&self) -> bool {
+        !self.seen_candidates.is_empty()
+            && self.seen_candidates.is_subset(&self.finished_candidates)
+            && self.finished_candidates.len() as u64 >= self.expected_candidate_count
+    }
+
+    /// Set the number of terminal candidates required before EOF is successful.
+    pub(crate) fn set_expected_candidate_count(&mut self, count: u64) {
+        self.expected_candidate_count = count.max(1);
     }
 
     /// Enable the OpenAI trailing usage chunk for this stream.
@@ -523,41 +538,61 @@ pub(crate) fn transform_stream_chunk(
     state.ensure_completion_id(obj.and_then(|o| o.get("responseId")).and_then(Value::as_str));
     state.capture_usage(obj);
 
-    let candidates = obj.and_then(|o| o.get("candidates")).and_then(Value::as_array);
-
     // Detect upstream errors and content blocks that arrive as valid JSON
     // but carry no candidates. Without this check these frames silently
     // produce empty deltas that look like successful completions.
-    if candidates.is_none_or(Vec::is_empty) {
+    let Some(candidates) = obj
+        .and_then(|o| o.get("candidates"))
+        .and_then(Value::as_array)
+        .filter(|candidates| !candidates.is_empty())
+    else {
         reject_upstream_error_frame(obj)?;
+        return Ok(None);
+    };
+    let choices = build_stream_choices(candidates, state)?;
+    if choices.is_empty() {
         return Ok(None);
     }
 
-    let choices = candidates
-        .into_iter()
-        .flatten()
-        .enumerate()
-        .map(|(position, candidate)| build_stream_choice(candidate, position as u64, state))
-        .collect::<Result<Vec<_>, _>>()?;
+    serialize_stream_chunk(choices, model, state)
+}
 
+/// Serialize one OpenAI content chunk, including the usage placeholder.
+fn serialize_stream_chunk(
+    choices: Vec<Value>,
+    model: &str,
+    state: &StreamTranslateState,
+) -> Result<Option<Vec<u8>>, String> {
     let mut chunk = json!({
         "id": state.completion_id.as_deref().unwrap_or(super::FALLBACK_RESPONSE_ID),
         "object": "chat.completion.chunk",
         "created": state.created,
         "model": model,
-        "choices": choices,
     });
+    let Some(obj) = chunk.as_object_mut() else {
+        return Err("failed to build stream chunk object".to_owned());
+    };
+    obj.insert("choices".to_owned(), Value::Array(choices));
     // OpenAI: when include_usage is set, every content chunk carries
     // `usage: null`; the populated object is a later, separate chunk.
-    if state.include_usage
-        && let Some(obj) = chunk.as_object_mut()
-    {
+    if state.include_usage {
         obj.insert("usage".to_owned(), Value::Null);
     }
 
     serde_json::to_vec(&chunk)
         .map(Some)
         .map_err(|e| format!("serialization failed: {e}"))
+}
+
+/// Build all non-empty choices from one Gemini stream frame.
+fn build_stream_choices(candidates: &[Value], state: &mut StreamTranslateState) -> Result<Vec<Value>, String> {
+    let candidate_indices = resolve_stream_candidate_indices(candidates)?;
+    candidates
+        .iter()
+        .zip(candidate_indices)
+        .map(|(candidate, candidate_index)| build_stream_choice(candidate, candidate_index, state))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|choices| choices.into_iter().flatten().collect())
 }
 
 /// Build the trailing OpenAI usage chunk (`choices: []`) if the client
@@ -584,13 +619,49 @@ pub(crate) fn take_stream_usage_chunk(state: &mut StreamTranslateState, model: &
         .ok()
 }
 
+/// Resolve stable candidate identities before mutating stream state.
+///
+/// Gemini omits protobuf-default index zero for a single candidate. In a
+/// multi-candidate frame, however, a missing index is ambiguous and must not
+/// be guessed from the candidate's transient array position.
+fn resolve_stream_candidate_indices(candidates: &[Value]) -> Result<Vec<u64>, String> {
+    let require_explicit_indices = candidates.len() > 1;
+    let mut indices = Vec::with_capacity(candidates.len());
+    let mut frame_indices = BTreeSet::new();
+
+    for candidate in candidates {
+        let index = match candidate.get("index") {
+            Some(Value::Number(index)) => index
+                .as_u64()
+                .ok_or_else(|| "candidate index must be a non-negative integer".to_owned())?,
+            None | Some(Value::Null) if !require_explicit_indices => 0,
+            None | Some(Value::Null) => {
+                return Err("multi-candidate stream frame contains a candidate without an explicit index".to_owned());
+            },
+            Some(_) => return Err("candidate index must be a non-negative integer".to_owned()),
+        };
+
+        if !frame_indices.insert(index) {
+            return Err(format!(
+                "multi-candidate stream frame contains duplicate candidate index {index}"
+            ));
+        }
+        indices.push(index);
+    }
+
+    Ok(indices)
+}
+
 /// Build a single OpenAI streaming choice from a Gemini candidate.
 fn build_stream_choice(
     candidate: &Value,
-    default_index: u64,
+    candidate_index: u64,
     state: &mut StreamTranslateState,
-) -> Result<Value, String> {
-    let candidate_index = candidate.get("index").and_then(Value::as_u64).unwrap_or(default_index);
+) -> Result<Option<Value>, String> {
+    if should_ignore_finished_candidate(candidate, candidate_index, state)? {
+        return Ok(None);
+    }
+    state.seen_candidates.insert(candidate_index);
     let parts = candidate
         .get("content")
         .and_then(|c| c.get("parts"))
@@ -598,7 +669,7 @@ fn build_stream_choice(
 
     let finish_reason = candidate.get("finishReason").and_then(Value::as_str);
     if finish_reason.is_some() {
-        state.saw_finish_reason = true;
+        state.finished_candidates.insert(candidate_index);
     }
     let is_first_delta = state.started_candidates.insert(candidate_index);
     let slots = state.slots_by_candidate.entry(candidate_index).or_default();
@@ -614,7 +685,39 @@ fn build_stream_choice(
         .and_then(convert_logprobs_result)
         .unwrap_or(Value::Null);
 
-    Ok(json!({ "index": candidate_index, "delta": delta, "logprobs": logprobs, "finish_reason": finish }))
+    Ok(Some(
+        json!({ "index": candidate_index, "delta": delta, "logprobs": logprobs, "finish_reason": finish }),
+    ))
+}
+
+/// Ignore metadata-only terminal repeats and reject all other post-finish data.
+fn should_ignore_finished_candidate(
+    candidate: &Value,
+    candidate_index: u64,
+    state: &StreamTranslateState,
+) -> Result<bool, String> {
+    if !state.finished_candidates.contains(&candidate_index) {
+        return Ok(false);
+    }
+    if is_empty_duplicate_terminal(candidate) {
+        return Ok(true);
+    }
+    Err(format!(
+        "candidate {candidate_index} emitted data after its finishReason"
+    ))
+}
+
+/// Return whether a post-finish candidate repeats only terminal metadata.
+fn is_empty_duplicate_terminal(candidate: &Value) -> bool {
+    let has_finish_reason = candidate.get("finishReason").and_then(Value::as_str).is_some();
+    let has_no_parts = match candidate.get("content").and_then(|content| content.get("parts")) {
+        None => true,
+        Some(Value::Array(parts)) => parts.is_empty(),
+        Some(_) => false,
+    };
+    let has_no_logprobs = candidate.get("logprobsResult").is_none_or(Value::is_null);
+
+    has_finish_reason && has_no_parts && has_no_logprobs
 }
 
 /// Reject SSE frames that carry an upstream error or prompt-level content block.
@@ -1709,6 +1812,96 @@ mod tests {
         assert_eq!(parsed["choices"][1]["index"], 1);
         assert_eq!(parsed["choices"][1]["delta"]["content"], "second");
         assert_eq!(parsed["choices"][1]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn stream_single_candidate_without_index_defaults_to_zero() {
+        let mut state = new_stream_state(1);
+        let parsed = translate_stream(
+            &mut state,
+            br#"{"candidates":[{"content":{"parts":[{"text":"first"}]}}]}"#,
+        );
+
+        assert_eq!(parsed["choices"][0]["index"], 0);
+    }
+
+    #[test]
+    fn stream_multi_candidate_frame_requires_explicit_indices() {
+        let mut state = new_stream_state(1);
+        let err = transform_stream_chunk(
+            br#"{"candidates":[{"index":1,"content":{"parts":[{"text":"second"}]}},{"content":{"parts":[{"text":"first"}]}}]}"#,
+            "gemini-1.5-pro",
+            &mut state,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("without an explicit index"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn stream_multi_candidate_frame_rejects_duplicate_indices() {
+        let mut state = new_stream_state(1);
+        let err = transform_stream_chunk(
+            br#"{"candidates":[{"index":1,"content":{"parts":[{"text":"one"}]}},{"index":1,"content":{"parts":[{"text":"two"}]}}]}"#,
+            "gemini-1.5-pro",
+            &mut state,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("duplicate candidate index 1"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn stream_late_single_candidate_uses_explicit_index() {
+        let mut state = new_stream_state(1);
+        let parsed = translate_stream(
+            &mut state,
+            br#"{"candidates":[{"index":1,"content":{"parts":[{"text":"continued"}]}}]}"#,
+        );
+
+        assert_eq!(parsed["choices"][0]["index"], 1);
+    }
+
+    #[test]
+    fn stream_ignores_empty_duplicate_terminal_and_keeps_usage() {
+        let mut state = new_stream_state(1);
+        state.set_include_usage(true);
+        drop(translate_stream(
+            &mut state,
+            br#"{"candidates":[{"index":0,"content":{"parts":[]},"finishReason":"STOP"}]}"#,
+        ));
+
+        let duplicate = transform_stream_chunk(
+            br#"{"candidates":[{"index":0,"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":1,"totalTokenCount":4}}"#,
+            "gemini-1.5-pro",
+            &mut state,
+        )
+        .unwrap();
+        assert!(duplicate.is_none());
+
+        let usage: Value =
+            serde_json::from_slice(&take_stream_usage_chunk(&mut state, "gemini-1.5-pro").unwrap()).unwrap();
+        assert_eq!(usage["usage"]["total_tokens"], 4);
+    }
+
+    #[test]
+    fn stream_rejects_nonempty_frame_after_candidate_finished() {
+        let mut state = new_stream_state(1);
+        drop(translate_stream(
+            &mut state,
+            br#"{"candidates":[{"index":0,"content":{"parts":[]},"finishReason":"STOP"}]}"#,
+        ));
+
+        let err = transform_stream_chunk(
+            br#"{"candidates":[{"index":0,"content":{"parts":[{"text":"late"}]},"finishReason":"STOP"}]}"#,
+            "gemini-1.5-pro",
+            &mut state,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("emitted data after its finishReason"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

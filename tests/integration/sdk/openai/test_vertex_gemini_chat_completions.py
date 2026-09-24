@@ -41,7 +41,7 @@ from urllib.parse import urlparse
 
 import httpx
 import pytest
-from openai import APIStatusError, OpenAI
+from openai import APIError, APIStatusError, OpenAI
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -184,6 +184,19 @@ class FakeVertexGeminiHandler(BaseHTTPRequestHandler):
             if parts and "text" in parts[0]:
                 user_text = parts[0]["text"]
 
+        if "trigger truncated stream" in user_text.lower():
+            self._send_sse_bytes(
+                b'data: {"candidates":[{"index":0,"content":{"parts":[{"text":"partial"}]}}]}\n\n'
+            )
+            return
+
+        if "trigger stream frame error" in user_text.lower():
+            self._send_sse_bytes(
+                b"data: not-json\n\n"
+                b'data: {"candidates":[{"index":0,"content":{"parts":[{"text":"must-not-leak"}]},"finishReason":"STOP"}]}\n\n'
+            )
+            return
+
         # Generate all chunks first to compute total size (for Content-Length)
         if has_tool_use:
             chunks = self._make_gemini_streaming_tool_chunks()
@@ -196,13 +209,16 @@ class FakeVertexGeminiHandler(BaseHTTPRequestHandler):
         body_str = "".join(body_lines)
         body_bytes = body_str.encode()
 
-        # Send response with explicit Content-Length (no chunked encoding)
+        self._send_sse_bytes(body_bytes)
+
+    def _send_sse_bytes(self, body: bytes) -> None:
+        """Send an exact SSE byte sequence and close the connection."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Content-Length", str(len(body_bytes)))
+        self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(body_bytes)
+        self.wfile.write(body)
 
     def _make_gemini_response(self, user_text: str, has_tools: bool) -> dict[str, Any]:
         """Synthesize a Gemini generateContent response."""
@@ -686,6 +702,81 @@ class TestVertexGeminiChatCompletions:
         final_chunk = chunks[-1]
         assert final_chunk.choices[0].finish_reason == "stop", "Final chunk should have finish_reason"
 
+    def test_truncated_stream_raises_after_preserving_valid_data(self, openai_client: OpenAI) -> None:
+        """A clean EOF without finishReason is an SDK-visible failure."""
+        chunks = []
+        with pytest.raises(APIError):
+            with openai_client.chat.completions.create(
+                model="gemini-2.0-flash",
+                messages=[{"role": "user", "content": "Trigger truncated stream"}],
+                stream=True,
+            ) as stream:
+                chunks.extend(stream)
+
+        content = "".join(
+            chunk.choices[0].delta.content or ""
+            for chunk in chunks
+            if chunk.choices
+        )
+        assert content == "partial"
+
+    def test_frames_after_stream_error_are_suppressed(self, openai_client: OpenAI) -> None:
+        """An invalid frame makes the stream terminal and drops later frames."""
+        chunks = []
+        with pytest.raises(APIError):
+            with openai_client.chat.completions.create(
+                model="gemini-2.0-flash",
+                messages=[{"role": "user", "content": "Trigger stream frame error"}],
+                stream=True,
+            ) as stream:
+                chunks.extend(stream)
+
+        content = "".join(
+            chunk.choices[0].delta.content or ""
+            for chunk in chunks
+            if chunk.choices
+        )
+        assert "must-not-leak" not in content
+
+    def test_invalid_include_usage_is_rejected(self, openai_client: OpenAI) -> None:
+        """The proxy rejects an invalid include_usage type before Vertex."""
+        with pytest.raises(APIStatusError) as exc_info:
+            openai_client.chat.completions.create(
+                model="gemini-2.0-flash",
+                messages=[{"role": "user", "content": "Hello"}],
+                stream=True,
+                stream_options={"include_usage": "true"},
+            )
+
+        assert exc_info.value.status_code == 400
+        assert "stream_options.include_usage" in exc_info.value.body["message"]
+
+    def test_malformed_tool_arguments_are_rejected(self, openai_client: OpenAI) -> None:
+        """Malformed assistant tool arguments are never replaced with an empty object."""
+        with pytest.raises(APIStatusError) as exc_info:
+            openai_client.chat.completions.create(
+                model="gemini-2.0-flash",
+                messages=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_weather",
+                                    "arguments": "not-json",
+                                },
+                            }
+                        ],
+                    }
+                ],
+            )
+
+        assert exc_info.value.status_code == 400
+        assert "arguments are not valid JSON" in exc_info.value.body["message"]
+
     def test_request_body_translation(self, openai_client: OpenAI) -> None:
         """Request is correctly translated from OpenAI to Gemini format."""
         openai_client.chat.completions.create(
@@ -706,6 +797,48 @@ class TestVertexGeminiChatCompletions:
 
         # OpenAI format should NOT be present
         assert "messages" not in request_body, "Should not have OpenAI 'messages' field"
+
+    def test_array_form_assistant_and_tool_content_translation(
+        self, openai_client: OpenAI
+    ) -> None:
+        """Valid array-form history survives translation through the official SDK."""
+        openai_client.chat.completions.create(
+            model="gemini-2.0-flash",
+            messages=[
+                {"role": "user", "content": "Start"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "First"},
+                        {"type": "text", "text": "Second"},
+                    ],
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "search", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": [
+                        {"type": "text", "text": "first result"},
+                        {"type": "text", "text": "second result"},
+                    ],
+                },
+                {"role": "user", "content": "Continue"},
+            ],
+        )
+
+        contents = json.loads(FakeVertexGeminiHandler.last_request_body)["contents"]
+        assert contents[1]["role"] == "model"
+        assert contents[1]["parts"][0:2] == [{"text": "First"}, {"text": "Second"}]
+        assert contents[1]["parts"][2]["functionCall"]["name"] == "search"
+        assert contents[2]["parts"][0]["functionResponse"]["response"] == {
+            "result": "first result\nsecond result"
+        }
 
     def test_empty_body_rejection(self, openai_client: OpenAI) -> None:
         """Model name is required in request."""

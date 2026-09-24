@@ -7,6 +7,8 @@
 //! parameter nesting under `generationConfig`, tool definitions, and
 //! `stream` flag extraction for URL path selection.
 
+use std::borrow::Cow;
+
 use serde_json::{Map, Value, json};
 use tracing::warn;
 
@@ -27,6 +29,11 @@ pub(crate) struct TransformResult {
     /// OpenAI `stream_options.include_usage`. Vertex has no equivalent;
     /// the response path emits a trailing usage chunk when this is set.
     pub include_usage: bool,
+    /// Number of candidates expected in a successful response.
+    ///
+    /// The streaming response path uses this to reject an EOF where only a
+    /// subset of the requested candidates reached a terminal finish reason.
+    pub candidate_count: u64,
 }
 
 /// Transform an OpenAI Chat Completions request body into Vertex AI
@@ -47,10 +54,7 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<TransformResult, String> 
         return Err("request body is not a JSON object".to_owned());
     };
 
-    let model = extract_model(obj)?;
-
-    let stream = extract_stream_flag(obj)?;
-    let include_usage = include_usage_requested(obj, stream)?;
+    let (model, stream, include_usage, candidate_count) = extract_request_options(obj)?;
 
     let mut gemini = Map::new();
 
@@ -84,7 +88,16 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<TransformResult, String> 
         model,
         stream,
         include_usage,
+        candidate_count,
     })
+}
+
+/// Extract fields that control upstream routing and streaming lifecycle.
+fn extract_request_options(obj: &Map<String, Value>) -> Result<(String, bool, bool, u64), String> {
+    let model = extract_model(obj)?;
+    let stream = extract_stream_flag(obj)?;
+    let include_usage = include_usage_requested(obj, stream)?;
+    Ok((model, stream, include_usage, expected_candidate_count(obj)))
 }
 
 /// Extract and validate the `model` field from the request body.
@@ -131,17 +144,22 @@ fn extract_stream_flag(obj: &Map<String, Value>) -> Result<bool, String> {
 
 /// Extract `stream_options.include_usage` from the request.
 ///
-/// Only meaningful with `stream: true`; returns `false` otherwise.
-/// Returns `Err` when the field is present but is not a JSON boolean.
+/// Returns `Err` when `stream_options` is used without streaming, is not an
+/// object, or contains a non-boolean `include_usage` value.
 fn include_usage_requested(obj: &Map<String, Value>, stream: bool) -> Result<bool, String> {
-    let Some(stream_options) = obj.get("stream_options") else {
-        return Ok(false);
+    let stream_options = match obj.get("stream_options") {
+        None | Some(Value::Null) => return Ok(false),
+        Some(Value::Object(options)) => options,
+        Some(_) => return Err("\"stream_options\" must be an object or null".to_owned()),
     };
+    if !stream {
+        return Err("\"stream_options\" requires \"stream\": true".to_owned());
+    }
     let Some(include_usage) = stream_options.get("include_usage") else {
         return Ok(false);
     };
     match include_usage {
-        Value::Bool(b) => Ok(stream && *b),
+        Value::Bool(b) => Ok(*b),
         Value::Null => Ok(false),
         other => {
             let kind = match other {
@@ -156,6 +174,14 @@ fn include_usage_requested(obj: &Map<String, Value>, stream: bool) -> Result<boo
             ))
         },
     }
+}
+
+/// Return the number of terminal candidates expected from a successful stream.
+fn expected_candidate_count(obj: &Map<String, Value>) -> u64 {
+    obj.get("n")
+        .and_then(Value::as_u64)
+        .filter(|count| *count > 0)
+        .unwrap_or(1)
 }
 
 // -----------------------------------------------------------------------------
@@ -331,11 +357,7 @@ fn guess_mime_type(url: &str) -> &'static str {
 fn convert_assistant_message(contents: &mut Vec<Value>, msg: &Value) -> Result<(), String> {
     let mut parts = Vec::new();
 
-    if let Some(text) = msg.get("content").and_then(Value::as_str)
-        && !text.is_empty()
-    {
-        parts.push(json!({ "text": text }));
-    }
+    collect_assistant_content(&mut parts, msg.get("content"));
 
     if let Some(Value::Array(tool_calls)) = msg.get("tool_calls") {
         for tc in tool_calls {
@@ -350,6 +372,32 @@ fn convert_assistant_message(contents: &mut Vec<Value>, msg: &Value) -> Result<(
     }
 
     Ok(())
+}
+
+/// Convert string or array-form assistant content into Gemini text parts.
+fn collect_assistant_content(parts: &mut Vec<Value>, content: Option<&Value>) {
+    match content {
+        Some(Value::String(text)) if !text.is_empty() => parts.push(json!({ "text": text })),
+        Some(Value::Array(content_parts)) => {
+            for part in content_parts {
+                let part_type = part.get("type").and_then(Value::as_str).unwrap_or("<missing>");
+                let text = match part_type {
+                    "text" => part.get("text").and_then(Value::as_str),
+                    "refusal" => part.get("refusal").and_then(Value::as_str),
+                    _ => {
+                        warn!(part_type, "dropping unknown assistant content part type");
+                        None
+                    },
+                };
+                if let Some(text) = text
+                    && !text.is_empty()
+                {
+                    parts.push(json!({ "text": text }));
+                }
+            }
+        },
+        _ => {},
+    }
 }
 
 /// Convert a single OpenAI tool call to a Gemini `functionCall` part.
@@ -422,13 +470,13 @@ fn json_kind(v: &Value) -> &'static str {
 fn convert_tool_result(contents: &mut Vec<Value>, messages: &[Value], index: usize, msg: &Value) {
     let name = resolve_tool_function_name(messages, index, msg);
 
-    let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
+    let content = tool_result_content(msg.get("content"));
 
     // Gemini response must be a Struct (JSON object); wrap plain text and
     // valid-but-non-object JSON (arrays, numbers) in {"result": ...}.
-    let response: Value = match serde_json::from_str::<Value>(content) {
+    let response: Value = match serde_json::from_str::<Value>(&content) {
         Ok(Value::Object(map)) => Value::Object(map),
-        _ => json!({ "result": content }),
+        _ => json!({ "result": content.as_ref() }),
     };
 
     contents.push(json!({
@@ -440,6 +488,27 @@ fn convert_tool_result(contents: &mut Vec<Value>, messages: &[Value], index: usi
             }
         }]
     }));
+}
+
+/// Flatten OpenAI tool-result text parts while borrowing the common string form.
+fn tool_result_content(content: Option<&Value>) -> Cow<'_, str> {
+    match content {
+        Some(Value::String(text)) => Cow::Borrowed(text),
+        Some(Value::Array(parts)) => Cow::Owned(
+            parts
+                .iter()
+                .filter_map(|part| {
+                    if part.get("type").and_then(Value::as_str) == Some("text") {
+                        part.get("text").and_then(Value::as_str)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => Cow::Borrowed(""),
+    }
 }
 
 /// Resolve the function name for a tool/function result message.
@@ -830,6 +899,29 @@ mod tests {
     }
 
     #[test]
+    fn assistant_array_content_preserves_text_and_refusal_parts() {
+        let body = br#"{"model":"gemini-1.5-pro","messages":[
+            {"role":"assistant","content":[
+                {"type":"text","text":"First"},
+                {"type":"refusal","refusal":"Cannot do that"},
+                {"type":"text","text":"Second"}
+            ]}
+        ]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
+
+        assert_eq!(parsed["contents"][0]["role"], "model");
+        assert_eq!(
+            parsed["contents"][0]["parts"],
+            json!([
+                {"text": "First"},
+                {"text": "Cannot do that"},
+                {"text": "Second"}
+            ])
+        );
+    }
+
+    #[test]
     fn tool_result_with_name_field() {
         let body = br#"{"model":"gemini-1.5-pro","messages":[
             {"role":"tool","name":"get_weather","content":"{\"temp\":72}"}
@@ -940,6 +1032,39 @@ mod tests {
         assert_eq!(
             parsed["contents"][0]["parts"][0]["functionResponse"]["response"]["result"], "no results found",
             "non-JSON tool content should be wrapped in {{\"result\": ...}}"
+        );
+    }
+
+    #[test]
+    fn tool_result_array_content_preserves_text_parts() {
+        let body = br#"{"model":"gemini-1.5-pro","messages":[
+            {"role":"tool","name":"search","content":[
+                {"type":"text","text":"first result"},
+                {"type":"text","text":"second result"}
+            ]}
+        ]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
+
+        assert_eq!(
+            parsed["contents"][0]["parts"][0]["functionResponse"]["response"]["result"],
+            "first result\nsecond result"
+        );
+    }
+
+    #[test]
+    fn tool_result_array_content_preserves_json_object() {
+        let body = br#"{"model":"gemini-1.5-pro","messages":[
+            {"role":"tool","name":"get_weather","content":[
+                {"type":"text","text":"{\"temp\":72}"}
+            ]}
+        ]}"#;
+        let result = transform_request(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result.body).unwrap();
+
+        assert_eq!(
+            parsed["contents"][0]["parts"][0]["functionResponse"]["response"]["temp"],
+            72
         );
     }
 
@@ -1445,13 +1570,22 @@ mod tests {
     }
 
     #[test]
-    fn include_usage_without_stream_is_false() {
-        // include_usage is only meaningful when stream: true.
+    fn include_usage_without_stream_is_rejected() {
         let body = br#"{"model":"gemini-2.0-flash","stream":false,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"Hi"}]}"#;
-        let result = transform_request(body).unwrap();
+        let err = transform_request(body).unwrap_err();
         assert!(
-            !result.include_usage,
-            "include_usage must be false when stream is false"
+            err.contains("stream_options") && err.contains("stream"),
+            "stream_options without streaming must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn non_object_stream_options_is_rejected() {
+        let body = br#"{"model":"gemini-2.0-flash","stream":true,"stream_options":"invalid","messages":[{"role":"user","content":"Hi"}]}"#;
+        let err = transform_request(body).unwrap_err();
+        assert!(
+            err.contains("stream_options") && err.contains("object"),
+            "invalid stream_options container must be rejected: {err}"
         );
     }
 
@@ -1462,6 +1596,7 @@ mod tests {
         let parsed: Value = serde_json::from_slice(&result.body).unwrap();
 
         assert_eq!(parsed["generationConfig"]["candidateCount"], 3);
+        assert_eq!(result.candidate_count, 3);
     }
 
     #[test]
