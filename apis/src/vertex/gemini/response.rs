@@ -389,34 +389,33 @@ fn mint_tool_call_id() -> String {
 
 /// Map Gemini `finishReason` to OpenAI `finish_reason`.
 ///
-/// When the response contains `functionCall` parts, the finish reason
-/// is overridden to `"tool_calls"` regardless of the Gemini value
-/// (Gemini uses `STOP` for both text and function call completions).
-///
-/// Gemini `FinishReason` enum (full list, as of Vertex AI REST v1):
-/// `STOP`, `MAX_TOKENS`, `SAFETY`, `RECITATION`, `LANGUAGE`, `OTHER`,
-/// `BLOCKLIST`, `PROHIBITED_CONTENT`, `SPII`, `MALFORMED_FUNCTION_CALL`,
-/// `IMAGE_SAFETY`, `MODEL_ARMOR`, `FINISH_REASON_UNSPECIFIED`.
-///
-/// `MODEL_ARMOR` indicates the response was blocked by [Model Armor],
-/// Google's enterprise content-safety layer. It must map to
-/// `"content_filter"` — treating it as `"stop"` misreports a blocked
-/// response as a normal completion.
-///
-/// [Model Armor]: https://cloud.google.com/model-armor/docs/
+/// Explicit Gemini finish reasons take precedence over tool-call detection.
+/// `MAX_TOKENS` → `length`, safety/blocking reasons → `content_filter`,
+/// `MALFORMED_FUNCTION_CALL` → `stop`, and otherwise function calls → `tool_calls`.
 fn convert_finish_reason(reason: Option<&str>, has_tool_calls: bool) -> &'static str {
-    if has_tool_calls {
-        return "tool_calls";
-    }
-
     match reason {
         Some("MAX_TOKENS") => "length",
+        // Blocked/safety reasons always win — never report a blocked call as
+        // a successfully executable "tool_calls".
         Some(
-            "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "IMAGE_SAFETY" | "LANGUAGE"
-            | "OTHER" | "MODEL_ARMOR",
+            "SAFETY"
+            | "RECITATION"
+            | "BLOCKLIST"
+            | "PROHIBITED_CONTENT"
+            | "SPII"
+            | "IMAGE_SAFETY"
+            | "LANGUAGE"
+            | "OTHER"
+            | "MODEL_ARMOR",
         ) => "content_filter",
-        // STOP, MALFORMED_FUNCTION_CALL, FINISH_REASON_UNSPECIFIED,
-        // unknown, or absent all map to "stop".
+        // MALFORMED_FUNCTION_CALL means the model attempted a tool call but
+        // produced invalid arguments. It is not a content safety block, so
+        // it maps to "stop" rather than "content_filter". It still wins over
+        // has_tool_calls so the client is never told to execute a bad call.
+        Some("MALFORMED_FUNCTION_CALL") => "stop",
+        // Only promote to "tool_calls" when the completion was not blocked.
+        // Gemini uses STOP for both normal text and function-call completions.
+        _ if has_tool_calls => "tool_calls",
         _ => "stop",
     }
 }
@@ -1293,11 +1292,34 @@ mod tests {
 
     #[test]
     fn malformed_function_call_maps_to_stop() {
+        // MALFORMED_FUNCTION_CALL is not a content safety block — map to "stop",
+        // not "content_filter".
         let body = br#"{"candidates": [{"content": {"parts": []}, "finishReason": "MALFORMED_FUNCTION_CALL"}]}"#;
         let output = transform_response(body, "gemini-1.5-pro").unwrap();
         let parsed: Value = serde_json::from_slice(&output).unwrap();
 
-        assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            parsed["choices"][0]["finish_reason"], "stop",
+            "MALFORMED_FUNCTION_CALL must map to stop, not content_filter"
+        );
+    }
+
+    #[test]
+    fn blocked_finish_reason_beats_tool_call_parts() {
+        // A blocked or malformed finish reason must win over has_tool_calls.
+        // Returning "tool_calls" here would tell the client to execute a call
+        // that Gemini itself considered invalid or unsafe.
+        let body = br#"{"candidates": [{
+            "content": {"parts": [{"functionCall": {"name": "get_weather", "args": {"city": "NYC"}}}]},
+            "finishReason": "MALFORMED_FUNCTION_CALL"
+        }]}"#;
+        let output = transform_response(body, "gemini-1.5-pro").unwrap();
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+
+        assert_eq!(
+            parsed["choices"][0]["finish_reason"], "stop",
+            "MALFORMED_FUNCTION_CALL must not be promoted to tool_calls"
+        );
     }
 
     #[test]
