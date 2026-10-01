@@ -88,11 +88,13 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<TransformResult, String> 
     let value: Value = serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
 
     let obj = value.as_object().ok_or("request body is not a JSON object")?;
-    let include_usage = validate_request_semantics(obj)?;
+    obj.get("messages")
+        .and_then(Value::as_array)
+        .ok_or("missing required array field `messages`")?;
+    let stream = optional_bool(obj, "stream")?.unwrap_or(false);
+    let include_usage = validate_request_semantics(obj, stream)?;
 
     let model = extract_model_id(obj)?;
-
-    let stream = obj.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
     let mut converse: Map<String, Value> = Map::new();
 
@@ -107,7 +109,7 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<TransformResult, String> 
     converse.insert("messages".to_owned(), Value::Array(messages));
 
     // Inference parameters.
-    let inference_config = build_inference_config(obj);
+    let inference_config = build_inference_config(obj)?;
     if !inference_config.is_empty() {
         converse.insert("inferenceConfig".to_owned(), Value::Object(inference_config));
     }
@@ -132,8 +134,8 @@ pub(crate) fn transform_request(body: &[u8]) -> Result<TransformResult, String> 
 // -----------------------------------------------------------------------------
 
 /// Validate request semantics and return whether streaming usage was requested.
-fn validate_request_semantics(obj: &Map<String, Value>) -> Result<bool, String> {
-    let include_usage = validate_stream_options(obj)?;
+fn validate_request_semantics(obj: &Map<String, Value>, stream: bool) -> Result<bool, String> {
+    let include_usage = validate_stream_options(obj, stream)?;
 
     for (field, value) in obj {
         if is_supported_request_field(field) || value.is_null() || is_noop_request_field(field, value) {
@@ -141,6 +143,7 @@ fn validate_request_semantics(obj: &Map<String, Value>) -> Result<bool, String> 
         }
         return Err(format!("`{field}` is not supported by the Bedrock Converse translator"));
     }
+    drop(translate_tool_choice(obj)?);
     Ok(include_usage)
 }
 
@@ -163,14 +166,14 @@ fn is_supported_request_field(field: &str) -> bool {
 }
 
 /// Validate streaming options and return whether usage was requested.
-fn validate_stream_options(obj: &Map<String, Value>) -> Result<bool, String> {
+fn validate_stream_options(obj: &Map<String, Value>, stream: bool) -> Result<bool, String> {
     let Some(value) = obj.get("stream_options") else {
         return Ok(false);
     };
     if value.is_null() {
         return Ok(false);
     }
-    if obj.get("stream").and_then(Value::as_bool) != Some(true) {
+    if !stream {
         return Err("`stream_options` requires `stream: true`".to_owned());
     }
 
@@ -192,6 +195,15 @@ fn validate_stream_options(obj: &Map<String, Value>) -> Result<bool, String> {
     }
 
     Ok(include_usage)
+}
+
+/// Read a nullable optional boolean without silently coercing other types.
+fn optional_bool(obj: &Map<String, Value>, field: &str) -> Result<Option<bool>, String> {
+    match obj.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(format!("`{field}` must be a boolean")),
+    }
 }
 
 /// Return whether an unsupported field carries its documented no-op default.
@@ -227,6 +239,9 @@ fn validate_model_id_for_path(model: &str) -> Result<(), String> {
         return Err(format!(
             "field `model` must be between 1 and {MAX_MODEL_ID_LEN} characters"
         ));
+    }
+    if model == "." || model == ".." {
+        return Err("field `model` is not a valid Bedrock model ID".to_owned());
     }
 
     let pattern = MODEL_ID_REGEX
@@ -296,14 +311,11 @@ fn append_system_content(parts: &mut Vec<Value>, content: &Value, role: &str) ->
 
 /// Translate the Chat Completions `messages` array into Bedrock Converse
 /// `messages`, skipping `system` and `developer` roles (handled separately).
-#[expect(
-    clippy::too_many_lines,
-    reason = "dispatches all user content-part types; splitting would spread related logic across functions"
-)]
 fn translate_messages(obj: &Map<String, Value>) -> Result<Vec<Value>, String> {
-    let Some(messages) = obj.get("messages").and_then(Value::as_array) else {
-        return Ok(Vec::new());
-    };
+    let messages = obj
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or("missing required array field `messages`")?;
 
     let mut out = Vec::new();
     for msg in messages {
@@ -315,52 +327,38 @@ fn translate_messages(obj: &Map<String, Value>) -> Result<Vec<Value>, String> {
             },
             "user" => {
                 let content = translate_user_content(msg)?;
-                out.push(serde_json::json!({
-                    "role": "user",
-                    "content": content
-                }));
+                push_or_merge_message(&mut out, "user", content);
             },
             "assistant" => {
                 let content = translate_assistant_content(msg)?;
-                out.push(serde_json::json!({
-                    "role": "assistant",
-                    "content": content
-                }));
+                push_or_merge_message(&mut out, "assistant", content);
             },
             "tool" => {
                 // Bedrock requires tool results inside a user-role message.
-                // Merge consecutive tool messages into one to preserve the
-                // required user/assistant role alternation.
                 let block = translate_tool_result(msg)?;
-                // Immutable check first so the borrow ends before the
-                // mutable access or push below.
-                let merge = out.last().is_some_and(|last| {
-                    last.get("role").and_then(Value::as_str) == Some("user")
-                        && last
-                            .get("content")
-                            .and_then(Value::as_array)
-                            .is_some_and(|c| c.iter().all(|b| b.get("toolResult").is_some()))
-                });
-                if merge {
-                    if let Some(arr) = out
-                        .last_mut()
-                        .and_then(|m| m.get_mut("content"))
-                        .and_then(Value::as_array_mut)
-                    {
-                        arr.push(block);
-                    }
-                } else {
-                    out.push(serde_json::json!({
-                        "role": "user",
-                        "content": [block]
-                    }));
-                }
+                push_or_merge_message(&mut out, "user", vec![block]);
             },
             other => return Err(format!("unsupported message role `{other}`")),
         }
     }
 
     Ok(out)
+}
+
+/// Preserve Bedrock's strict role alternation by combining adjacent messages
+/// with the same translated role while retaining content-block order.
+fn push_or_merge_message(out: &mut Vec<Value>, role: &str, mut blocks: Vec<Value>) {
+    if let Some(content) = out
+        .last_mut()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some(role))
+        .and_then(|message| message.get_mut("content"))
+        .and_then(Value::as_array_mut)
+    {
+        content.append(&mut blocks);
+        return;
+    }
+
+    out.push(serde_json::json!({"role": role, "content": blocks}));
 }
 
 // -----------------------------------------------------------------------------
@@ -481,18 +479,35 @@ fn translate_assistant_content(msg: &Value) -> Result<Vec<Value>, String> {
 ///
 /// Returns a single `{"toolResult": {...}}` block; the caller places it into
 /// a `user`-role message, merging with adjacent blocks when appropriate.
+#[expect(
+    clippy::too_many_lines,
+    reason = "validates both supported OpenAI tool-result content shapes before building one Bedrock block"
+)]
 fn translate_tool_result(msg: &Value) -> Result<Value, String> {
     let tool_use_id = msg
         .get("tool_call_id")
         .and_then(Value::as_str)
         .ok_or("tool message is missing `tool_call_id`")?;
 
-    // The tool result content can be a string or structured JSON.
+    // OpenAI tool results support a string or multipart text content.
     let content_block = match msg.get("content") {
         Some(Value::String(s)) => vec![serde_json::json!({"text": s})],
-        Some(v) if !v.is_null() => {
-            // Pass structured content through as JSON text.
-            vec![serde_json::json!({"json": v})]
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .map(|part| {
+                let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
+                if part_type != "text" {
+                    return Err(format!("unsupported tool content part type `{part_type}`"));
+                }
+                let text = part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or("tool text content part is missing `text`")?;
+                Ok(serde_json::json!({"text": text}))
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+        Some(value) if !value.is_null() => {
+            return Err("tool message `content` must be a string or array".to_owned());
         },
         _ => vec![serde_json::json!({"text": ""})],
     };
@@ -513,40 +528,56 @@ fn translate_tool_result(msg: &Value) -> Result<Value, String> {
 ///
 /// Only parameters in the Converse base set are mapped. Unsupported fields
 /// are rejected before this function is called.
-fn build_inference_config(obj: &Map<String, Value>) -> Map<String, Value> {
+#[expect(
+    clippy::too_many_lines,
+    reason = "maps the complete Bedrock inferenceConfig field set in one linear validation pass"
+)]
+fn build_inference_config(obj: &Map<String, Value>) -> Result<Map<String, Value>, String> {
     let mut cfg = Map::new();
 
     // max_tokens / max_completion_tokens → maxTokens
-    let max_tokens = obj.get("max_tokens").or_else(|| obj.get("max_completion_tokens"));
-    if let Some(n) = max_tokens.and_then(Value::as_u64) {
+    let max_tokens = obj
+        .get("max_tokens")
+        .filter(|value| !value.is_null())
+        .or_else(|| obj.get("max_completion_tokens").filter(|value| !value.is_null()));
+    if let Some(value) = max_tokens {
+        let n = value
+            .as_u64()
+            .ok_or("`max_tokens` and `max_completion_tokens` must be non-negative integers")?;
         cfg.insert("maxTokens".to_owned(), Value::Number(serde_json::Number::from(n)));
     }
 
     // temperature → temperature
-    if let Some(t) = obj.get("temperature").and_then(Value::as_f64)
-        && let Some(n) = serde_json::Number::from_f64(t)
-    {
+    if let Some(value) = obj.get("temperature").filter(|value| !value.is_null()) {
+        let t = value.as_f64().ok_or("`temperature` must be a number")?;
+        let n = serde_json::Number::from_f64(t).ok_or("`temperature` must be a finite number")?;
         cfg.insert("temperature".to_owned(), Value::Number(n));
     }
 
     // top_p → topP
-    if let Some(p) = obj.get("top_p").and_then(Value::as_f64)
-        && let Some(n) = serde_json::Number::from_f64(p)
-    {
+    if let Some(value) = obj.get("top_p").filter(|value| !value.is_null()) {
+        let p = value.as_f64().ok_or("`top_p` must be a number")?;
+        let n = serde_json::Number::from_f64(p).ok_or("`top_p` must be a finite number")?;
         cfg.insert("topP".to_owned(), Value::Number(n));
     }
 
     // stop → stopSequences (string or array)
     let stop_seqs = match obj.get("stop") {
         Some(Value::String(s)) => vec![Value::String(s.clone())],
-        Some(Value::Array(arr)) => arr.iter().filter(|v| v.is_string()).cloned().collect(),
-        _ => Vec::new(),
+        Some(Value::Array(values)) => {
+            if values.iter().any(|value| !value.is_string()) {
+                return Err("`stop` array values must be strings".to_owned());
+            }
+            values.clone()
+        },
+        None | Some(Value::Null) => Vec::new(),
+        Some(_) => return Err("`stop` must be a string or array of strings".to_owned()),
     };
     if !stop_seqs.is_empty() {
         cfg.insert("stopSequences".to_owned(), Value::Array(stop_seqs));
     }
 
-    cfg
+    Ok(cfg)
 }
 
 // -----------------------------------------------------------------------------
@@ -574,7 +605,7 @@ fn build_tool_config(obj: &Map<String, Value>) -> Result<Option<Value>, String> 
 
     let mut tool_config = serde_json::json!({"tools": bedrock_tools});
 
-    if let Some(choice) = translate_tool_choice(obj)
+    if let Some(choice) = translate_tool_choice(obj)?
         && let Some(obj) = tool_config.as_object_mut()
     {
         obj.insert("toolChoice".to_owned(), choice);
@@ -617,15 +648,25 @@ fn translate_tool_spec(tool: &Value) -> Result<Value, String> {
 /// | `"auto"` / absent         | `{"auto": {}}`                   |
 /// | `"required"`              | `{"any": {}}`                    |
 /// | `{"type":"function","function":{"name":"f"}}` | `{"tool":{"name":"f"}}` |
-fn translate_tool_choice(obj: &Map<String, Value>) -> Option<Value> {
+fn translate_tool_choice(obj: &Map<String, Value>) -> Result<Option<Value>, String> {
     match obj.get("tool_choice") {
-        Some(Value::String(s)) if s == "required" => Some(serde_json::json!({"any": {}})),
-        Some(Value::String(s)) if s == "none" => None,
+        None | Some(Value::Null) => Ok(Some(serde_json::json!({"auto": {}}))),
+        Some(Value::String(s)) if s == "auto" => Ok(Some(serde_json::json!({"auto": {}}))),
+        Some(Value::String(s)) if s == "required" => Ok(Some(serde_json::json!({"any": {}}))),
+        Some(Value::String(s)) if s == "none" => Ok(None),
+        Some(Value::String(s)) => Err(format!("unsupported `tool_choice` value `{s}`")),
         Some(Value::Object(tc)) => {
-            let name = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str)?;
-            Some(serde_json::json!({"tool": {"name": name}}))
+            if tc.get("type").and_then(Value::as_str) != Some("function") {
+                return Err("object `tool_choice` must have type `function`".to_owned());
+            }
+            let name = tc
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .ok_or("object `tool_choice` is missing `function.name`")?;
+            Ok(Some(serde_json::json!({"tool": {"name": name}})))
         },
-        _ => Some(serde_json::json!({"auto": {}})),
+        Some(_) => Err("`tool_choice` must be a string or object".to_owned()),
     }
 }
 
@@ -694,6 +735,8 @@ mod tests {
     fn unsafe_model_ids_are_rejected() {
         let models = [
             "",
+            ".",
+            "..",
             "../../../other-endpoint",
             "model?target=other",
             "model#fragment",
@@ -741,6 +784,46 @@ mod tests {
         assert_eq!(body["inferenceConfig"]["temperature"], 0.4);
         assert_eq!(body["inferenceConfig"]["topP"], 0.8);
         assert_eq!(body["inferenceConfig"]["stopSequences"], serde_json::json!(["done"]));
+    }
+
+    #[test]
+    fn null_max_tokens_uses_max_completion_tokens_fallback() {
+        let body = translate(r#"{"model":"m","messages":[],"max_tokens":null,"max_completion_tokens":128}"#);
+        assert_eq!(body["inferenceConfig"]["maxTokens"], 128);
+    }
+
+    #[test]
+    fn supported_request_fields_with_invalid_types_are_rejected() {
+        let fields = [
+            ("stream", serde_json::json!("true")),
+            ("max_tokens", serde_json::json!("128")),
+            ("max_completion_tokens", serde_json::json!(-1)),
+            ("temperature", serde_json::json!("0.4")),
+            ("top_p", serde_json::json!(true)),
+            ("stop", serde_json::json!(["done", 1])),
+            ("tool_choice", serde_json::json!(42)),
+        ];
+
+        for (field, value) in fields {
+            let request = serde_json::json!({
+                "model": "m",
+                "messages": [],
+                field: value,
+            });
+            let error = transform_request(request.to_string().as_bytes()).unwrap_err();
+            assert!(error.contains(field), "rejection must name `{field}`: {error}");
+        }
+    }
+
+    #[test]
+    fn messages_must_be_an_array() {
+        for request in [
+            serde_json::json!({"model": "m"}),
+            serde_json::json!({"model": "m", "messages": {}}),
+        ] {
+            let error = transform_request(request.to_string().as_bytes()).unwrap_err();
+            assert!(error.contains("messages"));
+        }
     }
 
     #[test]
@@ -1065,11 +1148,10 @@ mod tests {
         assert_eq!(tr["content"][0]["text"], "{\"temp\":18}");
     }
 
-    /// A `tool` message following a plain `user` message must produce a new
-    /// `user` message rather than appending its `toolResult` block to the
-    /// preceding one (which contains only text, not `toolResult` blocks).
+    /// A translated tool result has the Bedrock `user` role, so it must merge
+    /// with adjacent user content to preserve strict role alternation.
     #[test]
-    fn tool_message_after_plain_user_is_not_merged() {
+    fn tool_message_after_plain_user_is_merged() {
         let body = translate(
             r#"{"model":"m","messages":[
                 {"role":"user","content":"here is some context"},
@@ -1077,13 +1159,57 @@ mod tests {
             ]}"#,
         );
         let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(
-            msgs.len(),
-            2,
-            "tool result must not be merged into the preceding plain user message"
-        );
+        assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["content"][0]["text"], "here is some context");
-        assert!(msgs[1]["content"][0].get("toolResult").is_some());
+        assert!(msgs[0]["content"][1].get("toolResult").is_some());
+    }
+
+    #[test]
+    fn adjacent_user_and_assistant_messages_are_merged_by_role() {
+        let body = translate(
+            r#"{"model":"m","messages":[
+                {"role":"user","content":"first"},
+                {"role":"user","content":"second"},
+                {"role":"assistant","content":"third"},
+                {"role":"assistant","content":"fourth"}
+            ]}"#,
+        );
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(msgs[1]["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn multipart_tool_result_text_is_preserved() {
+        let body = translate(
+            r#"{"model":"m","messages":[
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"t1","type":"function","function":{"name":"f","arguments":"{}"}}
+                ]},
+                {"role":"tool","tool_call_id":"t1","content":[
+                    {"type":"text","text":"first"},
+                    {"type":"text","text":"second"}
+                ]}
+            ]}"#,
+        );
+        let content = body["messages"][1]["content"][0]["toolResult"]["content"]
+            .as_array()
+            .unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["text"], "first");
+        assert_eq!(content[1]["text"], "second");
+    }
+
+    #[test]
+    fn unsupported_multipart_tool_result_part_is_rejected() {
+        let error = transform_request(
+            br#"{"model":"m","messages":[
+                {"role":"tool","tool_call_id":"t1","content":[{"type":"image_url","image_url":{}}]}
+            ]}"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("tool content part type"));
     }
 
     /// Parallel tool calls produce multiple back-to-back `tool` messages.

@@ -100,6 +100,12 @@ const SSE_DONE: &[u8] = b"data: [DONE]\n\n";
 /// response.  Stored via [`HttpFilterContext::insert_filter_state`] so it
 /// survives multiple chunk deliveries.
 struct BedrockStreamingState {
+    /// Model returned on every translated SSE chunk.
+    model: String,
+    /// Response ID returned on every translated SSE chunk.
+    response_id: String,
+    /// Whether the caller opted into the final usage chunk.
+    include_usage: bool,
     /// Incremental binary frame decoder.  Holds any partial frame bytes
     /// that spanned a chunk boundary.
     decoder: EventStreamDecoder,
@@ -352,10 +358,13 @@ fn translate_success_body(
         return FilterAction::Continue;
     }
 
-    let model = ctx.get_metadata(MODEL_KEY).unwrap_or("unknown").to_owned();
-
     let bytes = body.as_deref().unwrap_or(&[]);
-    match transform_response(bytes, &model) {
+    let translated = transform_response(
+        bytes,
+        ctx.get_metadata(MODEL_KEY).unwrap_or("unknown"),
+        ctx.get_metadata(RESPONSE_ID_KEY).unwrap_or(response::FALLBACK_ID),
+    );
+    match translated {
         Ok(translated) => {
             *body = Some(Bytes::from(translated));
         },
@@ -396,18 +405,20 @@ fn translate_stream_chunk(
     end_of_stream: bool,
     max_frame_bytes: usize,
 ) -> FilterAction {
-    let model = ctx.get_metadata(MODEL_KEY).unwrap_or("unknown").to_owned();
-    let response_id = ctx
-        .get_metadata(RESPONSE_ID_KEY)
-        .unwrap_or(response::FALLBACK_ID)
-        .to_owned();
-    let include_usage = ctx.get_metadata(INCLUDE_USAGE_KEY) == Some("true");
-
     let chunk = body.take().unwrap_or_default();
 
     // Lazy-init the streaming state on the first body chunk.
     if ctx.get_filter_state::<BedrockStreamingState>().is_none() {
+        let model = ctx.get_metadata(MODEL_KEY).unwrap_or("unknown").to_owned();
+        let response_id = ctx
+            .get_metadata(RESPONSE_ID_KEY)
+            .unwrap_or(response::FALLBACK_ID)
+            .to_owned();
+        let include_usage = ctx.get_metadata(INCLUDE_USAGE_KEY) == Some("true");
         ctx.insert_filter_state(BedrockStreamingState {
+            model,
+            response_id,
+            include_usage,
             decoder: EventStreamDecoder::with_max_frame_len(max_frame_bytes),
             stream_state: StreamState::default(),
             failed: false,
@@ -428,14 +439,26 @@ fn translate_stream_chunk(
                     if msg.is_exception() {
                         state.failed = true;
                     }
-                    if msg.event_type() == Some("metadata") && !include_usage {
+                    if msg.event_type() == Some("metadata") && !state.include_usage {
                         continue;
                     }
-                    if let Some(json_bytes) = transform_stream_event(msg, &model, &response_id, &mut state.stream_state)
-                    {
-                        sse_output.extend_from_slice(b"data: ");
-                        sse_output.extend_from_slice(&json_bytes);
-                        sse_output.extend_from_slice(b"\n\n");
+                    match transform_stream_event(msg, &state.model, &state.response_id, &mut state.stream_state) {
+                        Ok(Some(json_bytes)) => {
+                            sse_output.extend_from_slice(b"data: ");
+                            sse_output.extend_from_slice(&json_bytes);
+                            sse_output.extend_from_slice(b"\n\n");
+                        },
+                        Ok(None) => {},
+                        Err(error) => {
+                            warn!(error = %error, "Bedrock stream event translation failed");
+                            append_sse_error(
+                                &mut sse_output,
+                                &format!("invalid Bedrock stream event: {error}"),
+                                "stream_translation_error",
+                            );
+                            state.failed = true;
+                            break;
+                        },
                     }
                 }
             },
@@ -804,6 +827,7 @@ mod tests {
         let mut ctx = make_filter_context(&req);
         ctx.set_metadata(RESPONSE_PATH_KEY, RESPONSE_PATH_SUCCESS);
         ctx.set_metadata(MODEL_KEY, "amazon.nova-lite-v1:0");
+        ctx.set_metadata(RESPONSE_ID_KEY, "chatcmpl-test");
 
         let bedrock_resp = serde_json::json!({
             "output": {
@@ -819,6 +843,7 @@ mod tests {
         filter.on_response_body(&mut ctx, &mut body, true).unwrap();
 
         let result: Value = serde_json::from_slice(&body.unwrap()).unwrap();
+        assert_eq!(result["id"], "chatcmpl-test");
         assert_eq!(result["object"], "chat.completion");
         assert_eq!(result["choices"][0]["message"]["content"], "Hello!");
         assert_eq!(result["choices"][0]["finish_reason"], "stop");
@@ -994,6 +1019,22 @@ mod tests {
 
         let text = std::str::from_utf8(body.as_deref().unwrap()).unwrap();
         assert!(text.contains("stream_decode_error"));
+        assert!(!text.contains("[DONE]"));
+    }
+
+    #[test]
+    fn malformed_stream_event_emits_error_without_done() {
+        let filter = make_filter("{}");
+        let req = make_request(Method::POST, "/v1/chat/completions");
+        let mut ctx = make_filter_context(&req);
+        ctx.current_filter_id = Some(0);
+        ctx.set_metadata(RESPONSE_PATH_KEY, RESPONSE_PATH_STREAM);
+
+        let mut body = Some(Bytes::from(event_stream_frame("messageStop", b"not-json")));
+        filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+        let text = std::str::from_utf8(body.as_deref().unwrap()).unwrap();
+        assert!(text.contains("stream_translation_error"));
         assert!(!text.contains("[DONE]"));
     }
 }

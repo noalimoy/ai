@@ -88,7 +88,7 @@ fn map_stop_reason(reason: &str) -> &'static str {
     clippy::too_many_lines,
     reason = "linear translation of several Bedrock fields; extracting further helpers would obscure the mapping"
 )]
-pub(crate) fn transform_response(body: &[u8], model: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn transform_response(body: &[u8], model: &str, id: &str) -> Result<Vec<u8>, String> {
     let root: Value = serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
     let obj = root.as_object().ok_or("response body is not a JSON object")?;
 
@@ -122,13 +122,14 @@ pub(crate) fn transform_response(body: &[u8], model: &str) -> Result<Vec<u8>, St
     }
 
     let response = serde_json::json!({
-        "id": FALLBACK_ID,
+        "id": id,
         "object": "chat.completion",
         "created": created_timestamp(),
         "model": model,
         "choices": [{
             "index": 0,
             "message": message_obj,
+            "logprobs": null,
             "finish_reason": finish_reason
         }],
         "usage": usage
@@ -232,7 +233,7 @@ fn created_timestamp() -> u64 {
 /// Per-event streaming state passed through `on_response_body` calls.
 ///
 /// Stored in `HttpFilterContext` filter state so it persists across chunks.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct StreamState {
     /// Index of the next tool call being streamed.
     pub tool_call_index: u32,
@@ -240,12 +241,25 @@ pub(crate) struct StreamState {
     pub role_emitted: bool,
     /// Accumulated finish reason from `messageStop`.
     pub finish_reason: Option<String>,
+    /// Response creation timestamp shared by every emitted chunk.
+    pub created: u64,
+}
+
+impl Default for StreamState {
+    fn default() -> Self {
+        Self {
+            tool_call_index: 0,
+            role_emitted: false,
+            finish_reason: None,
+            created: created_timestamp(),
+        }
+    }
 }
 
 /// Translate a single decoded [`EventStreamMessage`] into OpenAI SSE
 /// `data:` payload bytes.
 ///
-/// Returns `None` when the event type produces no client-visible output
+/// Returns `Ok(None)` when the event type produces no client-visible output
 /// (e.g. `contentBlockStart`, `contentBlockStop`).
 ///
 /// The caller (`mod.rs`) wraps the returned bytes with `data: ` + `\n\n`.
@@ -254,23 +268,23 @@ pub(crate) fn transform_stream_event(
     model: &str,
     id: &str,
     state: &mut StreamState,
-) -> Option<Vec<u8>> {
+) -> Result<Option<Vec<u8>>, String> {
     if msg.is_exception() {
-        return translate_exception_event(msg, model, id);
+        return translate_exception_event(msg, model, id, state.created);
     }
 
-    let event_type = msg.event_type()?;
+    let event_type = msg.event_type().ok_or("Bedrock event is missing `:event-type`")?;
 
     match event_type {
         "messageStart" => translate_message_start(model, id, state),
         "contentBlockStart" => translate_content_block_start(msg, model, id, state),
         "contentBlockDelta" => translate_content_block_delta(msg, model, id, state),
-        "contentBlockStop" => None, // no client output for block-stop
+        "contentBlockStop" => Ok(None), // no client output for block-stop
         "messageStop" => translate_message_stop(msg, model, id, state),
-        "metadata" => translate_metadata_event(msg, model, id),
+        "metadata" => translate_metadata_event(msg, model, id, state),
         other => {
             debug!(event_type = other, "ignoring unknown Bedrock event type");
-            None
+            Ok(None)
         },
     }
 }
@@ -280,11 +294,14 @@ pub(crate) fn transform_stream_event(
 // -----------------------------------------------------------------------------
 
 /// `messageStart` → emit role delta on the first event.
-fn translate_message_start(model: &str, id: &str, state: &mut StreamState) -> Option<Vec<u8>> {
+fn translate_message_start(model: &str, id: &str, state: &mut StreamState) -> Result<Option<Vec<u8>>, String> {
     state.role_emitted = true;
     chunk_bytes(
-        id,
-        model,
+        ChunkContext {
+            created: state.created,
+            id,
+            model,
+        },
         serde_json::json!({
             "role": "assistant",
             "content": ""
@@ -295,23 +312,43 @@ fn translate_message_start(model: &str, id: &str, state: &mut StreamState) -> Op
 }
 
 /// `contentBlockStart` → emit `tool_call` header if this is a `toolUse` block.
+#[expect(
+    clippy::too_many_lines,
+    reason = "validates one Bedrock event shape before emitting its corresponding OpenAI tool-call chunk"
+)]
 fn translate_content_block_start(
     msg: &EventStreamMessage,
     model: &str,
     id: &str,
     state: &mut StreamState,
-) -> Option<Vec<u8>> {
-    let payload: Value = serde_json::from_slice(&msg.payload).ok()?;
-    let tool_use = payload.get("start")?.get("toolUse")?;
+) -> Result<Option<Vec<u8>>, String> {
+    let payload: Value =
+        serde_json::from_slice(&msg.payload).map_err(|error| format!("invalid contentBlockStart payload: {error}"))?;
+    let start = payload
+        .get("start")
+        .and_then(Value::as_object)
+        .ok_or("contentBlockStart payload is missing object `start`")?;
+    let Some(tool_use) = start.get("toolUse") else {
+        return Ok(None);
+    };
 
-    let tool_use_id = tool_use.get("toolUseId").and_then(Value::as_str)?;
-    let name = tool_use.get("name").and_then(Value::as_str)?;
+    let tool_use_id = tool_use
+        .get("toolUseId")
+        .and_then(Value::as_str)
+        .ok_or("contentBlockStart toolUse is missing `toolUseId`")?;
+    let name = tool_use
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or("contentBlockStart toolUse is missing `name`")?;
     let index = state.tool_call_index;
     state.tool_call_index += 1;
 
     chunk_bytes(
-        id,
-        model,
+        ChunkContext {
+            created: state.created,
+            id,
+            model,
+        },
         serde_json::json!({}),
         None::<&str>,
         Some(vec![serde_json::json!({
@@ -324,31 +361,54 @@ fn translate_content_block_start(
 }
 
 /// `contentBlockDelta` → emit text delta or accumulated tool-call arguments.
+#[expect(
+    clippy::too_many_lines,
+    reason = "validates the Bedrock delta union, translates supported variants, and preserves valid unexposed variants"
+)]
 fn translate_content_block_delta(
     msg: &EventStreamMessage,
     model: &str,
     id: &str,
     state: &StreamState,
-) -> Option<Vec<u8>> {
-    let payload: Value = serde_json::from_slice(&msg.payload).ok()?;
-    let delta = payload.get("delta")?;
+) -> Result<Option<Vec<u8>>, String> {
+    let payload: Value =
+        serde_json::from_slice(&msg.payload).map_err(|error| format!("invalid contentBlockDelta payload: {error}"))?;
+    let delta = payload
+        .get("delta")
+        .and_then(Value::as_object)
+        .ok_or("contentBlockDelta payload is missing object `delta`")?;
 
     if let Some(text) = delta.get("text").and_then(Value::as_str) {
         // Text delta.
-        return chunk_bytes(id, model, serde_json::json!({"content": text}), None::<&str>, None);
+        return chunk_bytes(
+            ChunkContext {
+                created: state.created,
+                id,
+                model,
+            },
+            serde_json::json!({"content": text}),
+            None::<&str>,
+            None,
+        );
     }
 
     if let Some(tool_input) = delta.get("toolUse") {
         // Partial tool-call arguments string.
-        let partial_args = tool_input.get("input").and_then(Value::as_str).unwrap_or("");
+        let partial_args = tool_input
+            .get("input")
+            .and_then(Value::as_str)
+            .ok_or("contentBlockDelta toolUse is missing string `input`")?;
 
         // The index of the in-progress tool call is one before the counter
         // (it was incremented in contentBlockStart).
         let index = state.tool_call_index.saturating_sub(1);
 
         return chunk_bytes(
-            id,
-            model,
+            ChunkContext {
+                created: state.created,
+                id,
+                model,
+            },
             serde_json::json!({}),
             None::<&str>,
             Some(vec![serde_json::json!({
@@ -358,43 +418,84 @@ fn translate_content_block_delta(
         );
     }
 
-    None
+    // These are valid Bedrock union variants that Chat Completions cannot
+    // represent. Preserve the surrounding text stream instead of treating a
+    // recognized provider capability as malformed.
+    if ["reasoningContent", "citation", "toolResult", "image"]
+        .into_iter()
+        .any(|variant| delta.get(variant).is_some_and(Value::is_object))
+    {
+        return Ok(None);
+    }
+
+    Err("contentBlockDelta payload contains no supported delta".to_owned())
 }
 
 /// `messageStop` → emit `finish_reason` chunk.
-fn translate_message_stop(msg: &EventStreamMessage, model: &str, id: &str, state: &mut StreamState) -> Option<Vec<u8>> {
-    let finish_reason = if let Ok(payload) = serde_json::from_slice::<Value>(&msg.payload) {
-        payload
-            .get("stopReason")
-            .and_then(Value::as_str)
-            .map_or("stop", map_stop_reason)
-    } else {
-        "stop"
-    };
+fn translate_message_stop(
+    msg: &EventStreamMessage,
+    model: &str,
+    id: &str,
+    state: &mut StreamState,
+) -> Result<Option<Vec<u8>>, String> {
+    let payload: Value =
+        serde_json::from_slice(&msg.payload).map_err(|error| format!("invalid messageStop payload: {error}"))?;
+    let stop_reason = payload
+        .get("stopReason")
+        .and_then(Value::as_str)
+        .ok_or("messageStop payload is missing string `stopReason`")?;
+    let finish_reason = map_stop_reason(stop_reason);
 
     state.finish_reason = Some(finish_reason.to_owned());
 
-    chunk_bytes(id, model, serde_json::json!({}), Some(finish_reason), None)
+    chunk_bytes(
+        ChunkContext {
+            created: state.created,
+            id,
+            model,
+        },
+        serde_json::json!({}),
+        Some(finish_reason),
+        None,
+    )
 }
 
 /// `metadata` → emit usage chunk (may be sent as an additional SSE frame).
-fn translate_metadata_event(msg: &EventStreamMessage, model: &str, id: &str) -> Option<Vec<u8>> {
-    let payload: Value = serde_json::from_slice(&msg.payload).ok()?;
-    let usage = extract_usage(payload.get("usage"));
+fn translate_metadata_event(
+    msg: &EventStreamMessage,
+    model: &str,
+    id: &str,
+    state: &StreamState,
+) -> Result<Option<Vec<u8>>, String> {
+    let payload: Value =
+        serde_json::from_slice(&msg.payload).map_err(|error| format!("invalid metadata payload: {error}"))?;
+    let usage = payload
+        .get("usage")
+        .filter(|usage| usage.is_object())
+        .ok_or("metadata payload is missing object `usage`")?;
+    let usage = extract_usage(Some(usage));
 
     let chunk = serde_json::json!({
         "id":     id,
         "object": "chat.completion.chunk",
+        "created": state.created,
         "model":  model,
         "choices": [],
         "usage":  usage
     });
 
-    serde_json::to_vec(&chunk).ok()
+    serde_json::to_vec(&chunk)
+        .map(Some)
+        .map_err(|error| format!("stream chunk serialization failed: {error}"))
 }
 
 /// Exception frame → emit an error-shaped SSE chunk so clients see the error.
-fn translate_exception_event(msg: &EventStreamMessage, model: &str, id: &str) -> Option<Vec<u8>> {
+fn translate_exception_event(
+    msg: &EventStreamMessage,
+    model: &str,
+    id: &str,
+    created: u64,
+) -> Result<Option<Vec<u8>>, String> {
     let error_message = serde_json::from_slice::<Value>(&msg.payload)
         .ok()
         .and_then(|v| v.get("message").and_then(Value::as_str).map(ToOwned::to_owned))
@@ -409,10 +510,12 @@ fn translate_exception_event(msg: &EventStreamMessage, model: &str, id: &str) ->
     let chunk = serde_json::json!({
         "id":     id,
         "object": "chat.completion.chunk",
+        "created": created,
         "model":  model,
         "choices": [{
             "index": 0,
             "delta": {},
+            "logprobs": null,
             "finish_reason": "stop"
         }],
         "error": {
@@ -422,12 +525,25 @@ fn translate_exception_event(msg: &EventStreamMessage, model: &str, id: &str) ->
         }
     });
 
-    serde_json::to_vec(&chunk).ok()
+    serde_json::to_vec(&chunk)
+        .map(Some)
+        .map_err(|error| format!("stream exception serialization failed: {error}"))
 }
 
 // -----------------------------------------------------------------------------
 // Chunk builder helper
 // -----------------------------------------------------------------------------
+
+/// Response-scoped fields shared by every streaming chunk.
+#[derive(Clone, Copy)]
+struct ChunkContext<'a> {
+    /// Response creation timestamp.
+    created: u64,
+    /// Synthetic OpenAI response identifier.
+    id: &'a str,
+    /// Requested Bedrock model identifier.
+    model: &'a str,
+}
 
 /// Build a `chat.completion.chunk` JSON object and serialize it.
 ///
@@ -435,12 +551,11 @@ fn translate_exception_event(msg: &EventStreamMessage, model: &str, id: &str) ->
 /// * `finish_reason` — `Some(reason)` for the final chunk, `None` otherwise
 /// * `tool_calls` — optional list of tool-call delta objects
 fn chunk_bytes(
-    id: &str,
-    model: &str,
+    context: ChunkContext<'_>,
     delta: Value,
     finish_reason: Option<impl Serialize>,
     tool_calls: Option<Vec<Value>>,
-) -> Option<Vec<u8>> {
+) -> Result<Option<Vec<u8>>, String> {
     let finish_reason_value = finish_reason.map_or(Value::Null, |r| serde_json::to_value(r).unwrap_or(Value::Null));
 
     let mut delta_obj = delta;
@@ -451,17 +566,21 @@ fn chunk_bytes(
     }
 
     let chunk = serde_json::json!({
-        "id":     id,
+        "id":     context.id,
         "object": "chat.completion.chunk",
-        "model":  model,
+        "created": context.created,
+        "model":  context.model,
         "choices": [{
             "index":         0,
             "delta":         delta_obj,
+            "logprobs":      null,
             "finish_reason": finish_reason_value
         }]
     });
 
-    serde_json::to_vec(&chunk).ok()
+    serde_json::to_vec(&chunk)
+        .map(Some)
+        .map_err(|error| format!("stream chunk serialization failed: {error}"))
 }
 
 // -----------------------------------------------------------------------------
@@ -475,6 +594,7 @@ mod tests {
     use crate::bedrock::eventstream::build_frame;
 
     const MODEL: &str = "anthropic.claude-3-sonnet-20240229-v1:0";
+    const ID: &str = "chatcmpl-test";
 
     fn decoded_msg(event_type: &str, payload: &[u8]) -> EventStreamMessage {
         use crate::bedrock::eventstream::EventStreamDecoder;
@@ -511,8 +631,9 @@ mod tests {
         });
 
         let body = serde_json::to_vec(&bedrock).unwrap();
-        let result: Value = serde_json::from_slice(&transform_response(&body, MODEL).unwrap()).unwrap();
+        let result: Value = serde_json::from_slice(&transform_response(&body, MODEL, ID).unwrap()).unwrap();
 
+        assert_eq!(result["id"], ID);
         assert_eq!(result["object"], "chat.completion");
         assert_eq!(result["model"], MODEL);
         assert_eq!(result["choices"][0]["message"]["role"], "assistant");
@@ -521,6 +642,7 @@ mod tests {
             "Paris is the capital of France."
         );
         assert_eq!(result["choices"][0]["finish_reason"], "stop");
+        assert!(result["choices"][0]["logprobs"].is_null());
         assert_eq!(result["usage"]["prompt_tokens"], 20);
         assert_eq!(result["usage"]["completion_tokens"], 8);
         assert_eq!(result["usage"]["total_tokens"], 28);
@@ -546,7 +668,7 @@ mod tests {
         });
 
         let body = serde_json::to_vec(&bedrock).unwrap();
-        let result: Value = serde_json::from_slice(&transform_response(&body, MODEL).unwrap()).unwrap();
+        let result: Value = serde_json::from_slice(&transform_response(&body, MODEL, ID).unwrap()).unwrap();
 
         assert_eq!(result["choices"][0]["finish_reason"], "tool_calls");
         let tc = &result["choices"][0]["message"]["tool_calls"][0];
@@ -574,7 +696,7 @@ mod tests {
         });
 
         let body = serde_json::to_vec(&bedrock).unwrap();
-        let result: Value = serde_json::from_slice(&transform_response(&body, MODEL).unwrap()).unwrap();
+        let result: Value = serde_json::from_slice(&transform_response(&body, MODEL, ID).unwrap()).unwrap();
 
         assert_eq!(result["choices"][0]["message"]["content"], "Let me check.");
         assert_eq!(
@@ -601,7 +723,7 @@ mod tests {
                 "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}
             });
             let body = serde_json::to_vec(&bedrock).unwrap();
-            let result: Value = serde_json::from_slice(&transform_response(&body, MODEL).unwrap()).unwrap();
+            let result: Value = serde_json::from_slice(&transform_response(&body, MODEL, ID).unwrap()).unwrap();
             assert_eq!(
                 result["choices"][0]["finish_reason"], expected,
                 "stopReason={bedrock_reason}"
@@ -616,13 +738,13 @@ mod tests {
             "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}
         });
         let body = serde_json::to_vec(&bedrock).unwrap();
-        let error = transform_response(&body, MODEL).unwrap_err();
+        let error = transform_response(&body, MODEL, ID).unwrap_err();
         assert!(error.contains("output.message"));
     }
 
     #[test]
     fn transform_response_invalid_json_errors() {
-        assert!(transform_response(b"not json", MODEL).is_err());
+        assert!(transform_response(b"not json", MODEL, ID).is_err());
     }
 
     // ── Streaming: messageStart ────────────────────────────────────────────
@@ -631,11 +753,13 @@ mod tests {
     fn stream_message_start_emits_role_delta() {
         let msg = decoded_msg("messageStart", br#"{"role":"assistant"}"#);
         let mut state = StreamState::default();
-        let bytes = transform_stream_event(&msg, MODEL, FALLBACK_ID, &mut state).unwrap();
+        let bytes = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap().unwrap();
         let chunk: Value = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(chunk["object"], "chat.completion.chunk");
+        assert_eq!(chunk["created"], state.created);
         assert_eq!(chunk["choices"][0]["delta"]["role"], "assistant");
+        assert!(chunk["choices"][0]["logprobs"].is_null());
         assert!(state.role_emitted);
     }
 
@@ -646,7 +770,7 @@ mod tests {
         let payload = br#"{"contentBlockIndex":0,"delta":{"text":"Hello!"}}"#;
         let msg = decoded_msg("contentBlockDelta", payload);
         let mut state = StreamState::default();
-        let bytes = transform_stream_event(&msg, MODEL, FALLBACK_ID, &mut state).unwrap();
+        let bytes = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap().unwrap();
         let chunk: Value = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(chunk["choices"][0]["delta"]["content"], "Hello!");
@@ -660,7 +784,7 @@ mod tests {
         let payload = br#"{"contentBlockIndex":1,"start":{"toolUse":{"toolUseId":"tc1","name":"lookup"}}}"#;
         let msg = decoded_msg("contentBlockStart", payload);
         let mut state = StreamState::default();
-        let bytes = transform_stream_event(&msg, MODEL, FALLBACK_ID, &mut state).unwrap();
+        let bytes = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap().unwrap();
         let chunk: Value = serde_json::from_slice(&bytes).unwrap();
 
         let tc = &chunk["choices"][0]["delta"]["tool_calls"][0];
@@ -679,7 +803,7 @@ mod tests {
             tool_call_index: 1,
             ..Default::default()
         };
-        let bytes = transform_stream_event(&msg, MODEL, FALLBACK_ID, &mut state).unwrap();
+        let bytes = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap().unwrap();
         let chunk: Value = serde_json::from_slice(&bytes).unwrap();
 
         let tc = &chunk["choices"][0]["delta"]["tool_calls"][0];
@@ -693,7 +817,7 @@ mod tests {
     fn stream_content_block_stop_produces_no_output() {
         let msg = decoded_msg("contentBlockStop", br#"{"contentBlockIndex":0}"#);
         let mut state = StreamState::default();
-        let result = transform_stream_event(&msg, MODEL, FALLBACK_ID, &mut state);
+        let result = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap();
         assert!(result.is_none());
     }
 
@@ -704,7 +828,7 @@ mod tests {
         let payload = br#"{"stopReason":"end_turn","additionalModelResponseFields":null}"#;
         let msg = decoded_msg("messageStop", payload);
         let mut state = StreamState::default();
-        let bytes = transform_stream_event(&msg, MODEL, FALLBACK_ID, &mut state).unwrap();
+        let bytes = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap().unwrap();
         let chunk: Value = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(chunk["choices"][0]["finish_reason"], "stop");
@@ -715,7 +839,7 @@ mod tests {
     fn stream_message_stop_tool_use_finish_reason() {
         let msg = decoded_msg("messageStop", br#"{"stopReason":"tool_use"}"#);
         let mut state = StreamState::default();
-        let bytes = transform_stream_event(&msg, MODEL, FALLBACK_ID, &mut state).unwrap();
+        let bytes = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap().unwrap();
         let chunk: Value = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(chunk["choices"][0]["finish_reason"], "tool_calls");
@@ -728,9 +852,10 @@ mod tests {
         let payload = br#"{"usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15},"metrics":{"latencyMs":200}}"#;
         let msg = decoded_msg("metadata", payload);
         let mut state = StreamState::default();
-        let bytes = transform_stream_event(&msg, MODEL, FALLBACK_ID, &mut state).unwrap();
+        let bytes = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap().unwrap();
         let chunk: Value = serde_json::from_slice(&bytes).unwrap();
 
+        assert_eq!(chunk["created"], state.created);
         assert_eq!(chunk["usage"]["prompt_tokens"], 10);
         assert_eq!(chunk["usage"]["completion_tokens"], 5);
         assert_eq!(chunk["usage"]["total_tokens"], 15);
@@ -743,9 +868,11 @@ mod tests {
     fn stream_exception_emits_error_chunk() {
         let msg = decoded_exception("throttlingException", br#"{"message":"Too many requests"}"#);
         let mut state = StreamState::default();
-        let bytes = transform_stream_event(&msg, MODEL, FALLBACK_ID, &mut state).unwrap();
+        let bytes = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap().unwrap();
         let chunk: Value = serde_json::from_slice(&bytes).unwrap();
 
+        assert_eq!(chunk["created"], state.created);
+        assert!(chunk["choices"][0]["logprobs"].is_null());
         assert_eq!(chunk["error"]["message"], "Too many requests");
         assert_eq!(chunk["error"]["code"], "throttlingException");
     }
@@ -756,8 +883,38 @@ mod tests {
     fn stream_unknown_event_produces_no_output() {
         let msg = decoded_msg("someFutureEvent", b"{}");
         let mut state = StreamState::default();
-        let result = transform_stream_event(&msg, MODEL, FALLBACK_ID, &mut state);
+        let result = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn stream_valid_unexposed_delta_preserves_the_stream() {
+        let msg = decoded_msg(
+            "contentBlockDelta",
+            br#"{"contentBlockIndex":0,"delta":{"reasoningContent":{"text":"Thinking"}}}"#,
+        );
+        let mut state = StreamState::default();
+        let result = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn malformed_stream_event_payloads_are_rejected() {
+        for event_type in ["contentBlockStart", "contentBlockDelta", "messageStop", "metadata"] {
+            let msg = decoded_msg(event_type, b"not-json");
+            let mut state = StreamState::default();
+            let error = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap_err();
+            assert!(error.contains(event_type), "unexpected error for {event_type}: {error}");
+        }
+    }
+
+    #[test]
+    fn message_stop_without_reason_is_rejected() {
+        let msg = decoded_msg("messageStop", b"{}");
+        let mut state = StreamState::default();
+        let error = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap_err();
+        assert!(error.contains("stopReason"));
+        assert!(state.finish_reason.is_none());
     }
 
     // ── map_stop_reason exhaustive ────────────────────────────────────────

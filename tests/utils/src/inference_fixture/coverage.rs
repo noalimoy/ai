@@ -1271,6 +1271,9 @@ mod tests {
                 vec!["responses_client_tool_compat", "responses_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
+                vec!["chat_completions_to_bedrock_converse"],
+                vec!["chat_completions_to_bedrock_converse"],
+                vec!["chat_completions_to_bedrock_converse"],
             ]
         );
         assert_eq!(
@@ -1325,9 +1328,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 45);
+        assert_eq!(report.features_total, 48);
         assert_eq!(report.scenarios_total, 44);
         assert_eq!(report.recordings_total, 49);
         assert_eq!(
@@ -1379,7 +1385,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 45);
+        assert_eq!(manifest.features.len(), 48);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1606,6 +1612,18 @@ mod tests {
                     &"messages.error.upstream_stream".to_owned(),
                     &vec!["messages/upstream-error-stream".to_owned()]
                 ),
+                (
+                    &"bedrock.converse.request.tool_results".to_owned(),
+                    &vec!["bedrock/basic-nonstream".to_owned()]
+                ),
+                (
+                    &"bedrock.converse.request.invalid_types".to_owned(),
+                    &vec!["bedrock/basic-nonstream".to_owned()]
+                ),
+                (
+                    &"bedrock.converse.streaming.malformed_event".to_owned(),
+                    &vec!["bedrock/basic-nonstream".to_owned()]
+                ),
             ]
         );
         assert_eq!(
@@ -1748,14 +1766,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)]
         );
-        assert_eq!(
-            manifest.features[44]
-                .providers
-                .iter()
-                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
-                .collect::<Vec<_>>(),
-            vec![("synthetic", CoverageStatus::SyntheticOnly)]
-        );
+        for feature in &manifest.features[44..48] {
+            assert_eq!(
+                feature
+                    .providers
+                    .iter()
+                    .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                    .collect::<Vec<_>>(),
+                vec![("synthetic", CoverageStatus::SyntheticOnly)]
+            );
+        }
         assert!(manifest.features.iter().all(|feature| {
             feature.reason.is_none() && feature.providers.values().all(|coverage| coverage.reason.is_none())
         }));
