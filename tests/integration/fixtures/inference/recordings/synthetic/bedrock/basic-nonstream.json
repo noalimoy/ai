@@ -186,7 +186,25 @@
                 }
               ],
               "model": "synthetic-bedrock-model",
-              "stream": false
+              "stream": false,
+              "tools": [
+                {
+                  "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "city": {
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "strict": true
+                  },
+                  "type": "function"
+                }
+              ]
             }
           }
         },
@@ -281,7 +299,31 @@
                   ],
                   "role": "user"
                 }
-              ]
+              ],
+              "toolConfig": {
+                "toolChoice": {
+                  "auto": {}
+                },
+                "tools": [
+                  {
+                    "toolSpec": {
+                      "inputSchema": {
+                        "json": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "city": {
+                              "type": "string"
+                            }
+                          },
+                          "type": "object"
+                        }
+                      },
+                      "name": "get_weather",
+                      "strict": true
+                    }
+                  }
+                ]
+              }
             }
           }
         },

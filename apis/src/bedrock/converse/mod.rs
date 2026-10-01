@@ -314,7 +314,7 @@ impl HttpFilter for OpenaiChatCompletionsToBedrockConverseFilter {
     ) -> Result<FilterAction, FilterError> {
         match ctx.get_metadata(RESPONSE_PATH_KEY) {
             Some(RESPONSE_PATH_ERROR) => Ok(translate_error_body(ctx, body, end_of_stream)),
-            Some(RESPONSE_PATH_SUCCESS) => Ok(translate_success_body(ctx, body, end_of_stream)),
+            Some(RESPONSE_PATH_SUCCESS) => translate_success_body(ctx, body, end_of_stream),
             Some(RESPONSE_PATH_STREAM) => Ok(translate_stream_chunk(
                 ctx,
                 body,
@@ -350,12 +350,12 @@ fn translate_error_body(ctx: &HttpFilterContext<'_>, body: &mut Option<Bytes>, e
 
 /// Buffer-and-replace the body with an OpenAI Chat Completions response.
 fn translate_success_body(
-    ctx: &mut HttpFilterContext<'_>,
+    ctx: &HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
     end_of_stream: bool,
-) -> FilterAction {
+) -> Result<FilterAction, FilterError> {
     if !end_of_stream {
-        return FilterAction::Continue;
+        return Ok(FilterAction::Continue);
     }
 
     let bytes = body.as_deref().unwrap_or(&[]);
@@ -363,34 +363,13 @@ fn translate_success_body(
         bytes,
         ctx.get_metadata(MODEL_KEY).unwrap_or("unknown"),
         ctx.get_metadata(RESPONSE_ID_KEY).unwrap_or(response::FALLBACK_ID),
-    );
-    match translated {
-        Ok(translated) => {
-            *body = Some(Bytes::from(translated));
-        },
-        Err(e) => {
-            warn!(error = %e, "Bedrock Converse: non-streaming response translation failed");
-            set_response_translation_error(ctx, body, &e);
-        },
-    }
-    FilterAction::Continue
-}
-
-/// Replace a malformed upstream success response with an OpenAI-shaped 502.
-fn set_response_translation_error(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, error: &str) {
-    if let Some(response) = ctx.response_header.as_mut() {
-        response.status = http::StatusCode::BAD_GATEWAY;
-        response.headers.insert(
-            http::header::CONTENT_TYPE,
-            http::HeaderValue::from_static("application/json"),
-        );
-    }
-    ctx.response_headers_modified = true;
-    *body = Some(Bytes::from(build_openai_error_body(
-        &format!("response translation failed: {error}"),
-        "server_error",
-        "response_translation_error",
-    )));
+    )
+    .map_err(|error| {
+        warn!(error = %error, "Bedrock Converse: non-streaming response translation failed");
+        FilterError::from(format!("Bedrock Converse response translation failed: {error}"))
+    })?;
+    *body = Some(Bytes::from(translated));
+    Ok(FilterAction::Continue)
 }
 
 /// Feed a binary `EventStream` chunk through the decoder and emit OpenAI SSE
@@ -850,25 +829,17 @@ mod tests {
     }
 
     #[test]
-    fn malformed_success_response_becomes_openai_502() {
+    fn malformed_success_response_aborts_body_translation() {
         let filter = make_filter("{}");
         let req = make_request(Method::POST, "/v1/chat/completions");
-        let mut upstream = make_response();
         let mut ctx = make_filter_context(&req);
-        ctx.response_header = Some(&mut upstream);
         ctx.set_metadata(RESPONSE_PATH_KEY, RESPONSE_PATH_SUCCESS);
         ctx.set_metadata(MODEL_KEY, "amazon.nova-lite-v1:0");
 
         let mut body = Some(Bytes::from_static(b"{}"));
-        filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+        let error = filter.on_response_body(&mut ctx, &mut body, true).unwrap_err();
 
-        assert_eq!(
-            ctx.response_header.as_ref().unwrap().status,
-            http::StatusCode::BAD_GATEWAY
-        );
-        let result: Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
-        assert_eq!(result["error"]["type"], "server_error");
-        assert_eq!(result["error"]["code"], "response_translation_error");
+        assert!(error.to_string().contains("response translation failed"));
     }
 
     // ── on_response_body — streaming ──────────────────────────────────────

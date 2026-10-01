@@ -620,24 +620,50 @@ fn translate_tool_spec(tool: &Value) -> Result<Value, String> {
     if tool.get("type").and_then(Value::as_str) != Some("function") {
         return Err("only function tools are supported".to_owned());
     }
-    let func = tool.get("function").ok_or("function tool is missing `function`")?;
+    let func = tool
+        .get("function")
+        .and_then(Value::as_object)
+        .ok_or("function tool is missing object `function`")?;
     let name = func
         .get("name")
         .and_then(Value::as_str)
         .ok_or("function tool is missing `function.name`")?;
-    let description = func.get("description").and_then(Value::as_str).unwrap_or("");
+    let description = optional_string_field(func, "description")?.filter(|description| !description.is_empty());
+    let strict = optional_bool_field(func, "strict")?;
     let schema = func
         .get("parameters")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({"type": "object"}));
 
-    Ok(serde_json::json!({
-        "toolSpec": {
-            "name": name,
-            "description": description,
-            "inputSchema": {"json": schema}
-        }
-    }))
+    let mut tool_spec = Map::new();
+    tool_spec.insert("name".to_owned(), Value::String(name.to_owned()));
+    tool_spec.insert("inputSchema".to_owned(), serde_json::json!({"json": schema}));
+    if let Some(description) = description {
+        tool_spec.insert("description".to_owned(), Value::String(description.to_owned()));
+    }
+    if let Some(strict) = strict {
+        tool_spec.insert("strict".to_owned(), Value::Bool(strict));
+    }
+
+    Ok(serde_json::json!({"toolSpec": tool_spec}))
+}
+
+/// Read an optional string function field while rejecting a wrong JSON type.
+fn optional_string_field<'a>(obj: &'a Map<String, Value>, field: &str) -> Result<Option<&'a str>, String> {
+    match obj.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(format!("`function.{field}` must be a string or null")),
+    }
+}
+
+/// Read an optional boolean function field while rejecting a wrong JSON type.
+fn optional_bool_field(obj: &Map<String, Value>, field: &str) -> Result<Option<bool>, String> {
+    match obj.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(format!("`function.{field}` must be a boolean or null")),
+    }
 }
 
 /// Translate Chat Completions `tool_choice` into a Bedrock `toolChoice` object.
@@ -1374,6 +1400,27 @@ mod tests {
         assert_eq!(spec["name"], "get_weather");
         assert_eq!(spec["description"], "Get weather");
         assert_eq!(spec["inputSchema"]["json"]["type"], "object");
+    }
+
+    #[test]
+    fn tool_without_description_omits_bedrock_description() {
+        let body = translate(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"f","parameters":{}}}]}"#,
+        );
+        let spec = &body["toolConfig"]["tools"][0]["toolSpec"];
+        assert!(spec.get("description").is_none());
+    }
+
+    #[test]
+    fn strict_tool_schema_is_preserved() {
+        let body = translate(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{
+                "name":"f","strict":true,"parameters":{"type":"object","additionalProperties":false}
+            }}]}"#,
+        );
+        assert_eq!(body["toolConfig"]["tools"][0]["toolSpec"]["strict"], true);
     }
 
     #[test]
