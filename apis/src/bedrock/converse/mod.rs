@@ -54,7 +54,7 @@ use self::{
     response::{StreamState, transform_response, transform_stream_event},
 };
 use crate::bedrock::{
-    eventstream::EventStreamDecoder,
+    eventstream::{EventStreamDecoder, EventStreamMessage},
     wire::{build_openai_error_body, normalize_error_response},
 };
 
@@ -409,48 +409,7 @@ fn translate_stream_chunk(
     if let Some(state) = ctx.get_filter_state_mut::<BedrockStreamingState>() {
         state.decoder.push(&chunk);
 
-        // `decode_all` drains every complete frame from the buffer,
-        // leaving any partial final frame in the decoder for the next
-        // `on_response_body` call.
-        match state.decoder.decode_all() {
-            Ok(messages) => {
-                for msg in &messages {
-                    if msg.is_exception() {
-                        state.failed = true;
-                    }
-                    if msg.event_type() == Some("metadata") && !state.include_usage {
-                        continue;
-                    }
-                    match transform_stream_event(msg, &state.model, &state.response_id, &mut state.stream_state) {
-                        Ok(Some(json_bytes)) => {
-                            sse_output.extend_from_slice(b"data: ");
-                            sse_output.extend_from_slice(&json_bytes);
-                            sse_output.extend_from_slice(b"\n\n");
-                        },
-                        Ok(None) => {},
-                        Err(error) => {
-                            warn!(error = %error, "Bedrock stream event translation failed");
-                            append_sse_error(
-                                &mut sse_output,
-                                &format!("invalid Bedrock stream event: {error}"),
-                                "stream_translation_error",
-                            );
-                            state.failed = true;
-                            break;
-                        },
-                    }
-                }
-            },
-            Err(e) => {
-                warn!(error = %e, "Bedrock EventStream decode error");
-                append_sse_error(
-                    &mut sse_output,
-                    &format!("invalid Bedrock event stream: {e}"),
-                    "stream_decode_error",
-                );
-                state.failed = true;
-            },
-        }
+        decode_stream_events(state, &mut sse_output);
 
         if end_of_stream && !state.failed && !state.decoder.is_empty() {
             append_sse_error(
@@ -488,6 +447,58 @@ fn translate_stream_chunk(
     };
 
     FilterAction::Continue
+}
+
+/// Decode every complete frame currently buffered and translate its events.
+fn decode_stream_events(state: &mut BedrockStreamingState, output: &mut Vec<u8>) {
+    // `decode_all` drains every complete frame from the buffer, leaving any
+    // partial final frame for the next `on_response_body` call.
+    match state.decoder.decode_all() {
+        Ok(messages) => append_translated_stream_events(state, &messages, output),
+        Err(error) => {
+            warn!(error = %error, "Bedrock EventStream decode error");
+            append_sse_error(
+                output,
+                &format!("invalid Bedrock event stream: {error}"),
+                "stream_decode_error",
+            );
+            state.failed = true;
+        },
+    }
+}
+
+/// Translate decoded Bedrock events into OpenAI SSE frames in wire order.
+fn append_translated_stream_events(
+    state: &mut BedrockStreamingState,
+    messages: &[EventStreamMessage],
+    output: &mut Vec<u8>,
+) {
+    for message in messages {
+        if message.is_exception() {
+            state.failed = true;
+        }
+        if message.event_type() == Some("metadata") && !state.include_usage {
+            continue;
+        }
+        match transform_stream_event(message, &state.model, &state.response_id, &mut state.stream_state) {
+            Ok(Some(json_bytes)) => {
+                output.extend_from_slice(b"data: ");
+                output.extend_from_slice(&json_bytes);
+                output.extend_from_slice(b"\n\n");
+            },
+            Ok(None) => {},
+            Err(error) => {
+                warn!(error = %error, "Bedrock stream event translation failed");
+                append_sse_error(
+                    output,
+                    &format!("invalid Bedrock stream event: {error}"),
+                    "stream_translation_error",
+                );
+                state.failed = true;
+                break;
+            },
+        }
+    }
 }
 
 /// Append an OpenAI-shaped streaming error event.
