@@ -29,7 +29,7 @@
         "response": {
           "status": 200,
           "headers": {"content-type": ["application/json"]},
-          "body": {"kind": "json", "value": {"id": "chatcmpl-recorded-0001", "object": "chat.completion", "created": 0, "model": "synthetic-vertex-model", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello", "refusal": null}, "finish_reason": "stop", "logprobs": null}], "usage": {}}}
+          "body": {"kind": "json", "value": {"id": "chatcmpl-recorded-0001", "object": "chat.completion", "created": 0, "model": "synthetic-vertex-model", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello", "refusal": null}, "finish_reason": "stop", "logprobs": null}]}}
         }
       },
       "upstream": {
@@ -58,7 +58,7 @@
         "response": {
           "status": 200,
           "headers": {"content-type": ["application/json"]},
-          "body": {"kind": "json", "value": {"id": "chatcmpl-recorded-0002", "object": "chat.completion", "created": 0, "model": "synthetic-vertex-model", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello again", "refusal": null}, "finish_reason": "stop", "logprobs": null}], "usage": {}}}
+          "body": {"kind": "json", "value": {"id": "chatcmpl-recorded-0002", "object": "chat.completion", "created": 0, "model": "synthetic-vertex-model", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello again", "refusal": null}, "finish_reason": "stop", "logprobs": null}]}}
         }
       },
       "upstream": {
