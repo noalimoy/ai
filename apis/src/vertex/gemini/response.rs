@@ -144,9 +144,10 @@ impl StreamTranslateState {
         }
     }
 
-    /// Set the OpenAI completion id once: Vertex `responseId` when the first
-    /// frame has one, otherwise a generated fallback. Later frames cannot
-    /// change it (a late `responseId` must not rewrite earlier chunk ids).
+    /// Set the OpenAI completion id once when an emitted chunk first needs it:
+    /// use Vertex `responseId` when present, otherwise generate a fallback.
+    /// Later frames cannot change it (a late `responseId` must not rewrite
+    /// earlier chunk ids).
     fn ensure_completion_id(&mut self, response_id: Option<&str>) -> Result<(), String> {
         if self.completion_id.is_none() {
             self.completion_id = Some(response_id_or_minted_fallback(response_id)?);
@@ -637,7 +638,6 @@ pub(crate) fn transform_stream_chunk(
     let value: Value = serde_json::from_slice(data).map_err(|e| format!("invalid JSON: {e}"))?;
     let obj = value.as_object();
 
-    state.ensure_completion_id(obj.and_then(|o| o.get("responseId")).and_then(Value::as_str))?;
     state.capture_usage(obj);
 
     // Detect upstream errors and content blocks that arrive as valid JSON
@@ -656,6 +656,7 @@ pub(crate) fn transform_stream_chunk(
         return Ok(None);
     }
 
+    state.ensure_completion_id(obj.and_then(|o| o.get("responseId")).and_then(Value::as_str))?;
     serialize_stream_chunk(choices, model, state)
 }
 
@@ -711,8 +712,13 @@ pub(crate) fn take_stream_usage_chunk(state: &mut StreamTranslateState, model: &
     if !state.include_usage {
         return None;
     }
-    let completion_id = state.completion_id.as_deref()?;
+    state.usage.as_ref()?;
+    if let Err(error) = state.ensure_completion_id(None) {
+        warn!(%error, "failed to generate completion id for trailing usage chunk");
+        return None;
+    }
     let usage = state.usage.take()?;
+    let completion_id = state.completion_id.as_deref()?;
     let chunk = json!({
         "id": completion_id,
         "object": "chat.completion.chunk",
@@ -2313,6 +2319,34 @@ mod tests {
         let usage: Value =
             serde_json::from_slice(&take_stream_usage_chunk(&mut state, "gemini-2.0-flash").unwrap()).unwrap();
         assert_eq!(usage["choices"], json!([]));
+        assert_eq!(usage["usage"]["total_tokens"], 15);
+        assert!(usage["id"].as_str().unwrap().starts_with("chatcmpl-vertex-"));
+    }
+
+    #[test]
+    fn stream_metadata_first_preserves_later_response_id() {
+        let mut state = new_stream_state(1);
+        state.set_include_usage(true);
+        assert!(
+            transform_stream_chunk(
+                br#"{"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}"#,
+                "gemini-2.0-flash",
+                &mut state,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(state.completion_id.is_none());
+
+        let content = translate_stream(
+            &mut state,
+            br#"{"responseId":"resp-after-metadata","candidates":[{"content":{"parts":[{"text":"Hi"}]},"finishReason":"STOP"}]}"#,
+        );
+        assert_eq!(content["id"], "resp-after-metadata");
+
+        let usage: Value =
+            serde_json::from_slice(&take_stream_usage_chunk(&mut state, "gemini-2.0-flash").unwrap()).unwrap();
+        assert_eq!(usage["id"], "resp-after-metadata");
         assert_eq!(usage["usage"]["total_tokens"], 15);
     }
 
