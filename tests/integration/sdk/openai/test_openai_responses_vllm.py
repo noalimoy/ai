@@ -73,7 +73,7 @@ TRUSTED_OWNER_HEADERS = {
 # These emulated values are normally established by a trusted authentication
 # boundary and captured into the dedicated MCP credential/assertion slots.
 TRUSTED_MCP_HEADERS = {
-    "x-user-mcp-key": "Bearer sdk-mcp-user-key",
+    "x-user-mcp-key": "sdk-mcp-user-key",
     "x-mcp-authorized": "Bearer sdk-mcp-authorized",
 }
 # The full-flow binding router maps model "vllm-chat" to the Chat Completions
@@ -286,6 +286,7 @@ def _write_full_flow_config(
     file_url_origin: str | None = None,
     web_search_provider: str = "brave",
     tool_admission: str | None = None,
+    require_connector: bool | None = None,
     mcp_minimum_approval: str | None = None,
 ) -> str:
     """Patch the shared full-flow example for live or recording backends."""
@@ -301,6 +302,13 @@ def _write_full_flow_config(
         marker = "      - filter: openai_mcp_tool_resolve\n"
         assert config.count(marker) == 1, config
         config = config.replace(marker, marker + tool_admission)
+    if require_connector is not None:
+        marker = "        require_connector: true\n"
+        assert config.count(marker) == 1, config
+        config = config.replace(
+            marker,
+            f"        require_connector: {str(require_connector).lower()}\n",
+        )
     config = config.replace("127.0.0.1:9999", ogx_endpoint or _ogx_endpoint())
     # The unified gateway wires openai_web_search_dispatch into the IRR; its config
     # resolves ${WEB_SEARCH_API_KEY} at startup and fails closed when unset.
@@ -568,11 +576,13 @@ def test_full_flow_config_writer_inherits_root_override(tmp_path, monkeypatch):
         backend_endpoint=_vllm_endpoint(),
         chat_translation_model=VLLM_MODEL,
         reasoning_dialect="vllm",
+        require_connector=False,
     )
     try:
         with open(path) as config_file:
             config = config_file.read()
         assert config.count("allow_root: true") == 1, config
+        assert config.count("require_connector: false") == 1, config
     finally:
         os.unlink(path)
 
@@ -5863,6 +5873,7 @@ def admission_proxy(
         backend_endpoint=_vllm_endpoint(),
         nemo_port=nemo_guardrails_server,
         tool_admission=_PROTECTED_ADMISSION_BLOCK,
+        require_connector=False,
     )
     binary = _find_binary()
 
@@ -5920,6 +5931,7 @@ def mcp_approval_floor_proxy(
         port,
         db_path,
         backend_endpoint=_vllm_endpoint(),
+        mcp_endpoint=f"http://127.0.0.1:{mcp_server}/mcp",
         nemo_port=nemo_guardrails_server,
         mcp_minimum_approval="always",
     )
@@ -5960,7 +5972,8 @@ def mcp_approval_floor_client(mcp_approval_floor_proxy):
     """Return an OpenAI client pointed at the approval-floor Praxis proxy."""
     proxy_port, _, _ = mcp_approval_floor_proxy
     return _make_openai_client(
-        proxy_port, default_headers=TRUSTED_OWNER_HEADERS
+        proxy_port,
+        default_headers={**TRUSTED_OWNER_HEADERS, **TRUSTED_MCP_HEADERS},
     )
 
 
@@ -6048,6 +6061,7 @@ def oversized_call_id_client(tmp_path_factory, request, mcp_server, search_serve
         port,
         db_path,
         backend_endpoint=f"127.0.0.1:{backend_port}",
+        mcp_endpoint=f"http://127.0.0.1:{mcp_server}/mcp",
     )
     binary = _find_binary()
 
@@ -6062,7 +6076,13 @@ def oversized_call_id_client(tmp_path_factory, request, mcp_server, search_serve
     try:
         _wait_for_proxy(port, proc, log_path)
         started = True
-        yield _make_openai_client(port, default_headers=TRUSTED_OWNER_HEADERS), mcp_server
+        yield (
+            _make_openai_client(
+                port,
+                default_headers={**TRUSTED_OWNER_HEADERS, **TRUSTED_MCP_HEADERS},
+            ),
+            mcp_server,
+        )
     finally:
         proc.send_signal(signal.SIGINT)
         try:
@@ -6995,7 +7015,7 @@ class TestAgenticLoopVLLM:
         assert MCPHandler.request_count() > requests_before
         assert MCPHandler.tool_call_count() > calls_before
         assert set(MCPHandler.authorization_headers) == {
-            TRUSTED_MCP_HEADERS["x-user-mcp-key"]
+            f"Bearer {TRUSTED_MCP_HEADERS['x-user-mcp-key']}"
         }
         assert set(MCPHandler.assertion_headers) == {
             TRUSTED_MCP_HEADERS["x-mcp-authorized"]
@@ -7119,7 +7139,7 @@ class TestAgenticLoopVLLM:
 
     @requires_vllm_compat
     def test_mcp_approval_read_only_selector_gates_over_never_name(
-        self, agentic_client, agentic_proxy,
+        self, agentic_client,
     ):
         """Issue #1398 (SDK path): always.read_only wins over never.tool_names.
 
@@ -7129,12 +7149,11 @@ class TestAgenticLoopVLLM:
         the fix the ignored read_only selector left only the never name-match and
         the tool executed automatically.
         """
-        _, mcp_port, _ = agentic_proxy
         tools = [
             {
                 "type": "mcp",
                 "server_label": "weather",
-                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "connector_id": "trusted-mcp",
                 "allowed_tools": ["get_weather"],
                 "require_approval": {
                     "always": {"read_only": True},
@@ -7171,7 +7190,7 @@ class TestAgenticLoopVLLM:
 
     @requires_vllm_compat
     def test_mcp_approval_read_only_selector_auto_executes(
-        self, agentic_client, agentic_proxy,
+        self, agentic_client,
     ):
         """Issue #1398 (SDK path): never.read_only exempts a read-only tool.
 
@@ -7180,12 +7199,11 @@ class TestAgenticLoopVLLM:
         request -- proving the discovered readOnlyHint drives the exemption
         through the OpenAI client.
         """
-        _, mcp_port, _ = agentic_proxy
         tools = [
             {
                 "type": "mcp",
                 "server_label": "weather",
-                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "connector_id": "trusted-mcp",
                 "allowed_tools": ["get_weather"],
                 "require_approval": {"never": {"read_only": True}},
             }
@@ -7508,7 +7526,7 @@ class TestAgenticLoopVLLM:
         round is rejected with a 502 before any approval is persisted and
         before the MCP tool executes.
         """
-        client, mcp_port = oversized_call_id_client
+        client, _ = oversized_call_id_client
         calls_before = MCPHandler.tool_call_count()
 
         with pytest.raises(openai.InternalServerError) as exc_info:
@@ -7521,7 +7539,7 @@ class TestAgenticLoopVLLM:
                     {
                         "type": "mcp",
                         "server_label": "weather",
-                        "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                        "connector_id": "trusted-mcp",
                         "allowed_tools": ["get_weather"],
                         "require_approval": "always",
                     }
@@ -7546,7 +7564,6 @@ class TestAgenticLoopVLLM:
     def test_operator_floor_forces_approval_over_client_never(
         self,
         mcp_approval_floor_client,
-        mcp_approval_floor_proxy,
     ):
         """Operator ``minimum_approval: always`` must force an approval exchange
         even when the client sends ``require_approval: "never"`` (issue #1723).
@@ -7554,7 +7571,6 @@ class TestAgenticLoopVLLM:
         The MCP server must receive zero ``tools/call`` because the floor stops
         dispatch and returns an ``mcp_approval_request`` instead.
         """
-        _, mcp_port, _ = mcp_approval_floor_proxy
         MCPHandler.authorization_headers.clear()
         calls_before = MCPHandler.tool_call_count()
 
@@ -7567,7 +7583,7 @@ class TestAgenticLoopVLLM:
                 {
                     "type": "mcp",
                     "server_label": "weather",
-                    "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                    "connector_id": "trusted-mcp",
                     "allowed_tools": ["get_weather"],
                     # The client opts out of approval; the operator floor overrides.
                     "require_approval": "never",
@@ -7619,7 +7635,7 @@ class TestAgenticLoopVLLM:
             # requires store=true; store=false is rejected before emit.
             store=True,
             max_output_tokens=256,
-            extra_headers={"x-user-mcp-key": f"Bearer {token}"},
+            extra_headers={"x-user-mcp-key": token},
         )
 
         assert any(item.type == "mcp_approval_request" for item in response.output), (
@@ -7666,7 +7682,7 @@ class TestAgenticLoopVLLM:
         )
         assert MCPHandler.authorization_headers
         assert set(MCPHandler.authorization_headers) == {
-            TRUSTED_MCP_HEADERS["x-user-mcp-key"]
+            f"Bearer {TRUSTED_MCP_HEADERS['x-user-mcp-key']}"
         }
         assert set(MCPHandler.assertion_headers) == {
             TRUSTED_MCP_HEADERS["x-mcp-authorized"]
