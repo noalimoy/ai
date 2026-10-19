@@ -9203,7 +9203,7 @@ class TestStreamingMcpDiscoveryFailureVLLM:
         # store=True -> the failed resource is persisted and retrievable
         # through the SDK, echoing the same failed status and error.
         assert response_id, "response.created must carry an id for retrieval"
-        retrieved = _retrieve_with_retry(agentic_client, response_id)
+        retrieved = _retrieve_with_retry(streaming_mcp_failure_client, response_id)
         rd = retrieved.model_dump()
         assert rd["status"] == "failed", rd
         assert rd["error"]["code"] == "server_error", rd
