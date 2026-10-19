@@ -25,14 +25,16 @@ use crate::{
     openai::responses::{
         DEFAULT_TENANT_ID,
         agentic_loop::AgenticLoopFilter,
-        mcp_classify::{ApprovalPolicy, parse_approval_policy, requires_approval},
+        mcp_classify::{
+            ApprovalFloor, ApprovalPolicy, ApprovalSelector, parse_approval_policy, requires_approval,
+        },
         mcp_dispatch::{
             approval::{
                 ApprovalError, ResolvedApproval, bind_credential_context, bind_forwarded_header_context,
                 bind_owner_context, build_approved_tool_call, build_denial_message, extract_approval_responses,
                 is_approval_response, owner_fingerprint, parse_approval_response, resolve_approval, target_fingerprint,
             },
-            config::{McpDispatchConfig, build_config},
+            config::{McpDispatchConfig, MinimumApproval, build_config},
         },
         mcp_tool_resolve::{McpToolIndex, encode_function_name},
         state::{DeferredMcpConnector, McpApprovalState, McpConnectorContextPolicy, ResponsesState},
@@ -75,7 +77,7 @@ fn rejected_calls_do_not_dilute_admitted_result_allowance() {
 }
 
 #[test]
-fn mcp_call_ids_must_be_present_nonempty_and_unique() {
+fn mcp_call_ids_must_be_present_nonempty_unique_and_bounded() {
     let distinct = vec![json!({"call_id": "call_1"}), json!({"call_id": "call_2"})];
     assert!(mcp_call_ids_are_unique_and_new(&call_refs(&distinct), &[]));
 
@@ -87,6 +89,27 @@ fn mcp_call_ids_must_be_present_nonempty_and_unique() {
 
     let empty = vec![json!({"call_id": ""})];
     assert!(!mcp_call_ids_are_unique_and_new(&call_refs(&empty), &[]));
+
+    let oversized = vec![json!({"call_id": "x".repeat(super::MAX_MCP_CALL_ID_BYTES + 1)})];
+    assert!(
+        !mcp_call_ids_are_unique_and_new(&call_refs(&oversized), &[]),
+        "a call_id above the documented bound must be rejected before persistence"
+    );
+
+    let at_raw_bound = vec![json!({
+        "call_id": "x".repeat(super::MAX_MCP_CALL_ID_BYTES),
+        "name": "tool",
+    })];
+    assert!(mcp_call_ids_are_unique_and_new(&call_refs(&at_raw_bound), &[]));
+
+    let escaping_expands = vec![json!({
+        "call_id": "\0".repeat(super::MAX_MCP_CALL_ID_BYTES),
+        "name": "\0".repeat(64),
+    })];
+    assert!(
+        !mcp_call_ids_are_unique_and_new(&call_refs(&escaping_expands), &[]),
+        "a call_id whose serialized fallback exceeds the reservation must be rejected before persistence"
+    );
 
     let reused = vec![json!({"call_id": "call_1"})];
     assert!(!mcp_call_ids_are_unique_and_new(
@@ -136,6 +159,14 @@ fn parse_approval_absent_defaults_to_always() {
     assert_eq!(parse_approval_policy(&def), ApprovalPolicy::Always);
 }
 
+/// An `ApprovalSelector` selecting only by the given tool names.
+fn names_filter(list: &[&str]) -> ApprovalSelector {
+    ApprovalSelector {
+        names: Some(list.iter().map(|s| (*s).to_owned()).collect()),
+        read_only: None,
+    }
+}
+
 #[test]
 fn parse_approval_filter() {
     let def = json!({
@@ -144,30 +175,26 @@ fn parse_approval_filter() {
             "never": {"tool_names": ["safe_tool"]}
         }
     });
-    match parse_approval_policy(&def) {
-        ApprovalPolicy::Filter { always, never } => {
-            assert_eq!(always, vec!["dangerous_tool"]);
-            assert_eq!(never, vec!["safe_tool"]);
-        },
-        other => panic!("expected Filter, got {other:?}"),
-    }
+    assert_eq!(
+        parse_approval_policy(&def),
+        ApprovalPolicy::Filter {
+            always: names_filter(&["dangerous_tool"]),
+            never: names_filter(&["safe_tool"]),
+        }
+    );
 }
 
 #[test]
-fn parse_approval_filter_flat_array_fallback() {
+fn parse_approval_filter_flat_array_is_not_schema_fails_closed() {
+    // The bare-array member form is outside the MCPToolFilter schema, so the
+    // whole policy now fails closed to Always instead of being leniently parsed.
     let def = json!({
         "require_approval": {
             "always": ["dangerous_tool"],
             "never": ["safe_tool"]
         }
     });
-    match parse_approval_policy(&def) {
-        ApprovalPolicy::Filter { always, never } => {
-            assert_eq!(always, vec!["dangerous_tool"]);
-            assert_eq!(never, vec!["safe_tool"]);
-        },
-        other => panic!("expected Filter, got {other:?}"),
-    }
+    assert_eq!(parse_approval_policy(&def), ApprovalPolicy::Always);
 }
 
 #[test]
@@ -182,40 +209,40 @@ fn parse_approval_unrecognized_string_defaults_to_always() {
 
 #[test]
 fn requires_approval_always() {
-    assert!(requires_approval(&ApprovalPolicy::Always, "any_tool"));
+    assert!(requires_approval(&ApprovalPolicy::Always, "any_tool", false));
 }
 
 #[test]
 fn requires_approval_never() {
-    assert!(!requires_approval(&ApprovalPolicy::Never, "any_tool"));
+    assert!(!requires_approval(&ApprovalPolicy::Never, "any_tool", false));
 }
 
 #[test]
 fn requires_approval_filter_always_list() {
     let policy = ApprovalPolicy::Filter {
-        always: vec!["dangerous".to_owned()],
-        never: vec![],
+        always: names_filter(&["dangerous"]),
+        never: ApprovalSelector::default(),
     };
-    assert!(requires_approval(&policy, "dangerous"));
+    assert!(requires_approval(&policy, "dangerous", false));
 }
 
 #[test]
 fn requires_approval_filter_never_list() {
     let policy = ApprovalPolicy::Filter {
-        always: vec![],
-        never: vec!["safe".to_owned()],
+        always: ApprovalSelector::default(),
+        never: names_filter(&["safe"]),
     };
-    assert!(!requires_approval(&policy, "safe"));
+    assert!(!requires_approval(&policy, "safe", false));
 }
 
 #[test]
 fn requires_approval_filter_always_takes_precedence() {
     let policy = ApprovalPolicy::Filter {
-        always: vec!["tool_x".to_owned()],
-        never: vec!["tool_x".to_owned()],
+        always: names_filter(&["tool_x"]),
+        never: names_filter(&["tool_x"]),
     };
     assert!(
-        requires_approval(&policy, "tool_x"),
+        requires_approval(&policy, "tool_x", false),
         "always should take precedence over never"
     );
 }
@@ -223,41 +250,39 @@ fn requires_approval_filter_always_takes_precedence() {
 #[test]
 fn requires_approval_filter_unlisted_defaults_to_true() {
     let policy = ApprovalPolicy::Filter {
-        always: vec![],
-        never: vec!["other".to_owned()],
+        always: ApprovalSelector::default(),
+        never: names_filter(&["other"]),
     };
     assert!(
-        requires_approval(&policy, "unknown_tool"),
+        requires_approval(&policy, "unknown_tool", false),
         "unlisted tools should default to requiring approval"
     );
 }
 
 // =========================================================================
-// extract_tool_names edge cases (via parse_approval_policy)
+// Filter-member parsing edge cases (via parse_approval_policy)
 // =========================================================================
 
 #[test]
 fn parse_approval_filter_absent_sub_keys() {
     let def = json!({"require_approval": {}});
-    match parse_approval_policy(&def) {
-        ApprovalPolicy::Filter { always, never } => {
-            assert!(always.is_empty());
-            assert!(never.is_empty());
-        },
-        other => panic!("expected Filter, got {other:?}"),
-    }
+    assert_eq!(
+        parse_approval_policy(&def),
+        ApprovalPolicy::Filter {
+            always: ApprovalSelector::default(),
+            never: ApprovalSelector::default(),
+        }
+    );
 }
 
 #[test]
-fn parse_approval_filter_non_object_non_array_value() {
+fn parse_approval_filter_invalid_member_type_fails_closed() {
     let def = json!({"require_approval": {"always": 42, "never": true}});
-    match parse_approval_policy(&def) {
-        ApprovalPolicy::Filter { always, never } => {
-            assert!(always.is_empty(), "numeric value should produce empty list");
-            assert!(never.is_empty(), "boolean value should produce empty list");
-        },
-        other => panic!("expected Filter, got {other:?}"),
-    }
+    assert_eq!(
+        parse_approval_policy(&def),
+        ApprovalPolicy::Always,
+        "non-object filter members are outside the schema and must fail closed"
+    );
 }
 
 // =========================================================================
@@ -450,7 +475,7 @@ fn find_approval_required_returns_none_when_all_never() {
         json!({"name": "weather__get_weather", "call_id": "call_1"}),
         json!({"name": "docs__search_docs", "call_id": "call_2"}),
     ];
-    let (pending, ungated) = partition_calls_by_approval(call_refs(&calls), &tool_map);
+    let (pending, ungated) = partition_calls_by_approval(call_refs(&calls), &tool_map, ApprovalFloor::None);
     assert!(pending.is_empty());
     assert_eq!(ungated.len(), 2);
 }
@@ -462,7 +487,7 @@ fn find_approval_required_returns_first_when_absent() {
         json!({"name": "weather__get_weather", "call_id": "call_1"}),
         json!({"name": "docs__search_docs", "call_id": "call_2"}),
     ];
-    let (pending, ungated) = partition_calls_by_approval(call_refs(&calls), &tool_map);
+    let (pending, ungated) = partition_calls_by_approval(call_refs(&calls), &tool_map, ApprovalFloor::None);
     assert_eq!(pending.len(), 2);
     assert!(ungated.is_empty());
     assert_eq!(pending[0].tool_name, "get_weather");
@@ -482,7 +507,7 @@ fn find_approval_required_returns_first_requiring() {
         json!({"name": "weather__get_weather", "call_id": "call_1"}),
         json!({"name": "docs__search_docs", "call_id": "call_2", "arguments": {"query": "rust"}}),
     ];
-    let (pending, ungated) = partition_calls_by_approval(call_refs(&calls), &tool_map);
+    let (pending, ungated) = partition_calls_by_approval(call_refs(&calls), &tool_map, ApprovalFloor::None);
     assert_eq!(pending.len(), 1);
     assert_eq!(ungated.len(), 1);
     assert_eq!(pending[0].tool_name, "search_docs");
@@ -495,7 +520,9 @@ fn find_approval_required_defaults_to_approval_when_absent() {
     let tool_map = sample_tool_map();
     let calls = vec![json!({"name": "weather__get_weather", "call_id": "call_1"})];
     assert!(
-        !partition_calls_by_approval(call_refs(&calls), &tool_map).0.is_empty(),
+        !partition_calls_by_approval(call_refs(&calls), &tool_map, ApprovalFloor::None)
+            .0
+            .is_empty(),
         "absent require_approval should default to requiring approval"
     );
 }
@@ -504,7 +531,7 @@ fn find_approval_required_defaults_to_approval_when_absent() {
 fn find_approval_required_ambiguous_tool_requires_approval() {
     let tool_map = lossy_collision_tool_map();
     let calls = vec![json!({"name": "my_server__get", "call_id": "call_1"})];
-    let (pending, ungated) = partition_calls_by_approval(call_refs(&calls), &tool_map);
+    let (pending, ungated) = partition_calls_by_approval(call_refs(&calls), &tool_map, ApprovalFloor::None);
     assert!(
         !pending.is_empty(),
         "ambiguous encoded name should require approval even when all servers say never"
@@ -512,6 +539,53 @@ fn find_approval_required_ambiguous_tool_requires_approval() {
     assert!(ungated.is_empty());
     assert_eq!(pending[0].tool_name, "my_server__get");
     assert_eq!(pending[0].server_label, "unknown");
+}
+
+#[test]
+fn find_approval_required_read_only_selector_gates_writable_tool() {
+    // Issue #1398: the approval policy selects by annotation. Under
+    // `always.read_only=false` / `never.read_only=true`, the writable tool must
+    // route to approval while the read-only tool executes automatically — the
+    // `read_only` selector was previously ignored, so both decisions depended
+    // only on names.
+    let policy = json!({"always": {"read_only": false}, "never": {"read_only": true}});
+    let mut tool_map = HashMap::new();
+    tool_map.insert(
+        ("srv".to_owned(), "delete".to_owned()),
+        json!({
+            "server_label": "srv",
+            "server_url": "http://srv.example.com/mcp",
+            "headers": null,
+            "authorization": null,
+            "tool_definition": {"name": "delete", "annotations": {"readOnlyHint": false}},
+            "require_approval": policy.clone(),
+        }),
+    );
+    tool_map.insert(
+        ("srv".to_owned(), "list".to_owned()),
+        json!({
+            "server_label": "srv",
+            "server_url": "http://srv.example.com/mcp",
+            "headers": null,
+            "authorization": null,
+            "tool_definition": {"name": "list", "annotations": {"readOnlyHint": true}},
+            "require_approval": policy,
+        }),
+    );
+
+    let calls = vec![
+        json!({"name": "srv__delete", "call_id": "call_1"}),
+        json!({"name": "srv__list", "call_id": "call_2"}),
+    ];
+    let (pending, ungated) = partition_calls_by_approval(call_refs(&calls), &tool_map, ApprovalFloor::None);
+    assert_eq!(pending.len(), 1, "the writable tool must require approval");
+    assert_eq!(pending[0].tool_name, "delete");
+    assert_eq!(
+        ungated.len(),
+        1,
+        "the read-only tool is exempted by never.read_only=true"
+    );
+    assert_eq!(ungated[0]["call_id"], "call_2");
 }
 
 // =========================================================================
@@ -674,6 +748,83 @@ fn config_validates_forward_headers() {
 fn config_rejects_unknown_fields() {
     let result = serde_yaml::from_str::<McpDispatchConfig>("unknown_field: true");
     assert!(result.is_err(), "should reject unknown fields");
+}
+
+#[test]
+fn config_minimum_approval_defaults_to_none() {
+    let cfg = serde_yaml::from_str::<McpDispatchConfig>("{}").unwrap();
+    assert!(cfg.minimum_approval.is_none(), "the operator floor is unset by default");
+}
+
+#[test]
+fn config_minimum_approval_always_maps_to_floor() {
+    let cfg = serde_yaml::from_str::<McpDispatchConfig>("minimum_approval: always").unwrap();
+    assert_eq!(cfg.minimum_approval, Some(MinimumApproval::Always));
+    assert_eq!(cfg.minimum_approval.unwrap().as_floor(), ApprovalFloor::Always);
+    assert!(build_config(cfg).is_ok());
+}
+
+#[test]
+fn config_rejects_non_always_minimum_approval() {
+    // Only `always` is meaningful: a `never` floor would be a no-op and anything
+    // else is invalid, so both must fail closed rather than silently weaken policy.
+    for yaml in [
+        "minimum_approval: never",
+        "minimum_approval: sometimes",
+        "minimum_approval: true",
+    ] {
+        assert!(
+            serde_yaml::from_str::<McpDispatchConfig>(yaml).is_err(),
+            "should reject {yaml}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn on_request_body_publishes_configured_minimum_approval() {
+    // The dispatcher publishes the operator floor onto typed request state during
+    // the request phase so the agentic-loop owner reads it back when it partitions
+    // approvals in the response phase. A struct field (not step metadata) means a
+    // saturated metadata map can never silently drop the security floor.
+    let yaml: serde_yaml::Value = serde_yaml::from_str("minimum_approval: always").unwrap();
+    let filter = McpDispatchFilter::from_config(&yaml).unwrap();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.insert(ResponsesState::default());
+
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .mcp_operator_approval_floor,
+        ApprovalFloor::Always,
+        "a configured floor must be visible to the owner via typed request state"
+    );
+}
+
+#[tokio::test]
+async fn on_request_body_publishes_no_floor_when_unset() {
+    let filter = make_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.insert(ResponsesState::default());
+
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .mcp_operator_approval_floor,
+        ApprovalFloor::None,
+        "an unset floor leaves the client-driven policy in place"
+    );
 }
 
 #[test]
@@ -1698,7 +1849,7 @@ fn prepare_response_round_keeps_executable_calls() {
         ..ResponsesState::default()
     };
 
-    prepare_response_round(&mut state, 1).unwrap();
+    prepare_response_round(&mut state, 1, ApprovalFloor::None).unwrap();
 
     assert_eq!(
         state.tool_calls.len(),
@@ -1728,6 +1879,13 @@ fn prepare_response_round_rejects_invalid_call_ids() {
                 "output":"prior result"
             })],
         ),
+        (
+            vec![json!({
+                "name":"weather__get_weather",
+                "call_id":"x".repeat(super::MAX_MCP_CALL_ID_BYTES + 1)
+            })],
+            Vec::new(),
+        ),
     ] {
         let mut state = ResponsesState {
             mcp_tool_map: auto_approval_tool_map(),
@@ -1736,7 +1894,7 @@ fn prepare_response_round_rejects_invalid_call_ids() {
             ..ResponsesState::default()
         };
 
-        let failure = prepare_response_round(&mut state, 2).unwrap_err();
+        let failure = prepare_response_round(&mut state, 2, ApprovalFloor::None).unwrap_err();
 
         assert_eq!(failure.status, 502);
         assert_eq!(failure.code, "server_error");
@@ -1745,6 +1903,38 @@ fn prepare_response_round_rejects_invalid_call_ids() {
             "invalid MCP identities must report the call_id invariant"
         );
     }
+}
+
+#[test]
+fn prepare_response_round_rejects_oversized_call_id_before_approval_persistence() {
+    let mut state = ResponsesState {
+        mcp_tool_map: sample_tool_map(),
+        tool_calls: vec![json!({
+            "name": "weather__get_weather",
+            "call_id": "x".repeat(super::MAX_MCP_CALL_ID_BYTES + 1),
+            "arguments": "{\"city\":\"Paris\"}"
+        })],
+        store_persist_armed: true,
+        ..ResponsesState::default()
+    };
+
+    let failure = prepare_response_round(&mut state, 1, ApprovalFloor::None).unwrap_err();
+
+    assert_eq!(failure.status, 502);
+    assert_eq!(failure.code, "server_error");
+    assert!(
+        failure.message.contains("oversized"),
+        "the round must report the bounded call_id invariant: {}",
+        failure.message
+    );
+    assert!(
+        state.pending_approvals.is_empty(),
+        "an oversized correlation id must not reach durable pending state"
+    );
+    assert!(
+        state.accumulated_output.is_empty(),
+        "an oversized correlation id must not emit an approval request"
+    );
 }
 
 #[test]
@@ -1758,7 +1948,7 @@ fn prepare_response_round_enforces_configured_cap() {
         ..ResponsesState::default()
     };
 
-    let failure = prepare_response_round(&mut state, 1).unwrap_err();
+    let failure = prepare_response_round(&mut state, 1, ApprovalFloor::None).unwrap_err();
 
     assert_eq!(failure.status, 502);
     assert!(
@@ -1780,7 +1970,7 @@ fn prepare_response_round_emits_resumable_approval() {
         ..ResponsesState::default()
     };
 
-    prepare_response_round(&mut state, 1).unwrap();
+    prepare_response_round(&mut state, 1, ApprovalFloor::None).unwrap();
 
     assert!(
         state.tool_calls.is_empty(),
@@ -1814,7 +2004,7 @@ fn prepare_response_round_rejects_unresumable_approval() {
             ..ResponsesState::default()
         };
 
-        let failure = prepare_response_round(&mut state, 1).unwrap_err();
+        let failure = prepare_response_round(&mut state, 1, ApprovalFloor::None).unwrap_err();
 
         assert_eq!(failure.status, expected_status);
         assert!(
@@ -1851,7 +2041,7 @@ fn prepare_response_round_partitions_gated_and_executable_calls() {
         ..ResponsesState::default()
     };
 
-    prepare_response_round(&mut state, 2).unwrap();
+    prepare_response_round(&mut state, 2, ApprovalFloor::None).unwrap();
 
     assert_eq!(state.mcp_approval_state, McpApprovalState::ExecuteUngatedThenReturn);
     assert_eq!(
@@ -1868,6 +2058,88 @@ fn prepare_response_round_partitions_gated_and_executable_calls() {
 }
 
 #[test]
+fn prepare_response_round_floor_forces_approval_over_client_never() {
+    // Every tool says `require_approval: never`, yet the operator floor must turn
+    // the whole round into a pending approval with nothing left to execute — the
+    // "zero tools/call before approval" acceptance property at the owner layer.
+    let mut state = ResponsesState {
+        mcp_tool_map: auto_approval_tool_map(),
+        tool_calls: vec![json!({
+            "name": "weather__get_weather",
+            "call_id": "c1",
+            "arguments": "{\"city\":\"Paris\"}"
+        })],
+        store_persist_armed: true,
+        ..ResponsesState::default()
+    };
+
+    prepare_response_round(&mut state, 1, ApprovalFloor::Always).unwrap();
+
+    assert!(
+        state.tool_calls.is_empty(),
+        "the operator floor must leave no executable MCP call for request re-entry"
+    );
+    assert_eq!(state.mcp_approval_state, McpApprovalState::ApprovalPendingThenReturn);
+    assert_eq!(state.pending_approvals.len(), 1);
+    assert_eq!(state.accumulated_output[0]["type"], "mcp_approval_request");
+    assert_eq!(state.accumulated_output[0]["id"], "c1");
+}
+
+#[test]
+fn prepare_response_round_without_floor_keeps_client_never_executable() {
+    // Same inputs as above but no floor: the client `never` policy is preserved,
+    // so the call stays executable (the floor-unset behavior is unchanged).
+    let mut state = ResponsesState {
+        mcp_tool_map: auto_approval_tool_map(),
+        tool_calls: vec![json!({
+            "name": "weather__get_weather",
+            "call_id": "c1",
+            "arguments": "{}"
+        })],
+        store_persist_armed: true,
+        ..ResponsesState::default()
+    };
+
+    prepare_response_round(&mut state, 1, ApprovalFloor::None).unwrap();
+
+    assert_eq!(
+        state.tool_calls.len(),
+        1,
+        "without the floor a client 'never' stays executable"
+    );
+    assert_eq!(state.mcp_approval_state, McpApprovalState::None);
+    assert!(state.pending_approvals.is_empty());
+}
+
+#[test]
+fn prepare_response_round_floor_fails_closed_when_unresumable() {
+    // The floor forces approval, so the same fail-closed persistence guard applies:
+    // store=false is a client 400, an unarmed store is a server 500, and neither
+    // emits a stranded approval request.
+    for (request_body, expected_status) in [
+        (json!({"model":"gpt-4.1", "store":false}), 400),
+        (json!({"model":"gpt-4.1"}), 500),
+    ] {
+        let mut state = ResponsesState {
+            request_body,
+            mcp_tool_map: auto_approval_tool_map(),
+            tool_calls: vec![json!({"name": "weather__get_weather", "call_id": "c1"})],
+            store_persist_armed: false,
+            ..ResponsesState::default()
+        };
+
+        let failure = prepare_response_round(&mut state, 1, ApprovalFloor::Always).unwrap_err();
+
+        assert_eq!(failure.status, expected_status);
+        assert!(failure.message.contains("store"));
+        assert!(
+            state.pending_approvals.is_empty() && state.accumulated_output.is_empty(),
+            "a rejected floored approval must not create durable or client-visible state"
+        );
+    }
+}
+
+#[test]
 fn oversized_completed_result_becomes_a_bounded_per_call_error() {
     let call = json!({
         "name": "tool_name_far_beyond_the_normal_schema_boundary_but_still_bounded_by_the_fallback",
@@ -1875,7 +2147,8 @@ fn oversized_completed_result_becomes_a_bounded_per_call_error() {
     });
     let result = build_success_result("c1", "srv", "tool", "{}", &"x".repeat(4096), false, None);
 
-    let bounded = super::fit_result_or_limit_error(&call, result, super::MIN_RETAINED_RESULT_BYTES);
+    let bounded = super::fit_result_or_limit_error(&call, result, super::MIN_RETAINED_RESULT_BYTES)
+        .expect("the fallback must fit its pre-dispatch reservation");
 
     assert!(
         bounded.retained_bytes().unwrap() <= super::MIN_RETAINED_RESULT_BYTES,
@@ -1889,6 +2162,97 @@ fn oversized_completed_result_becomes_a_bounded_per_call_error() {
         "the bounded replacement must explain why the result was discarded"
     );
     assert_eq!(result_payload_limit(4096), 1024);
+}
+
+#[test]
+fn oversized_approval_id_limit_error_fails_terminally() {
+    let oversized_id = "x".repeat(super::MIN_RETAINED_RESULT_BYTES + 1);
+    let call = json!({
+        "name": "weather__get_weather",
+        "call_id": "c1",
+        "approval_request_id": oversized_id,
+    });
+    let result = build_success_result("c1", "srv", "tool", "{}", &"x".repeat(4096), false, Some(&oversized_id));
+
+    let outcome = super::fit_result_or_limit_error(&call, result, super::MIN_RETAINED_RESULT_BYTES);
+
+    assert!(
+        outcome.is_err(),
+        "an approval id that cannot fit the reservation must fail terminally instead of panicking"
+    );
+}
+
+#[test]
+fn bounded_approval_id_is_preserved_in_limit_error_fallback() {
+    let approval_id = "a".repeat(super::MAX_MCP_CALL_ID_BYTES);
+    let call = json!({
+        "name": "weather__get_weather",
+        "call_id": approval_id,
+        "approval_request_id": approval_id,
+    });
+    let result = build_success_result(
+        &approval_id,
+        "srv",
+        "tool",
+        "{}",
+        &"x".repeat(4096),
+        false,
+        Some(&approval_id),
+    );
+
+    let bounded = super::fit_result_or_limit_error(&call, result, super::MIN_RETAINED_RESULT_BYTES)
+        .expect("a gate-bounded approval id must fit the reservation");
+
+    assert!(
+        bounded.retained_bytes().unwrap() <= super::MIN_RETAINED_RESULT_BYTES,
+        "the retained result must stay within its hard memory bound"
+    );
+    assert_eq!(
+        bounded.output_item["approval_request_id"].as_str().unwrap(),
+        approval_id,
+        "a bounded correlation id must be preserved in full, never truncated"
+    );
+    assert_eq!(
+        bounded.message["call_id"].as_str().unwrap(),
+        approval_id,
+        "the function-call output must preserve the accepted call id"
+    );
+    assert_eq!(
+        bounded.output_item["id"].as_str().unwrap(),
+        approval_id,
+        "the MCP call item must preserve the accepted call id"
+    );
+}
+
+#[test]
+fn oversized_result_fallback_uses_the_call_reservation() {
+    let approval_id = "x".repeat(320);
+    let call = json!({
+        "name": "weather__get_weather",
+        "call_id": approval_id,
+        "approval_request_id": approval_id,
+    });
+    let result = build_success_result(
+        &approval_id,
+        "srv",
+        "tool",
+        "{}",
+        &"x".repeat(8192),
+        false,
+        Some(&approval_id),
+    );
+
+    let bounded = super::fit_result_or_limit_error(&call, result, 2048)
+        .expect("the fallback must fit the call's actual reservation");
+
+    assert!(
+        bounded.retained_bytes().unwrap() > super::MIN_RETAINED_RESULT_BYTES,
+        "the test must exercise a fallback above the minimum reservation"
+    );
+    assert!(
+        bounded.retained_bytes().unwrap() <= 2048,
+        "the fallback must be checked against the call's actual reservation"
+    );
 }
 
 // =========================================================================
@@ -2388,7 +2752,7 @@ fn resolve_to_dispatch_encoded_name_roundtrip() {
         ..ResponsesState::default()
     };
 
-    prepare_response_round(&mut state, 1).unwrap();
+    prepare_response_round(&mut state, 1, ApprovalFloor::None).unwrap();
 
     assert_eq!(
         state.tool_calls.len(),
