@@ -705,6 +705,7 @@ filter_chains:
       - filter: openai_mcp_tool_resolve
         user_credential: mcp_gateway
         authorization_assertion: mcp_gateway
+        require_connector: true
         forward_headers:
           - x-tenant-id
           - x-user-id
