@@ -1644,7 +1644,7 @@ fn require_connector_rejects_direct_url_before_any_callout() {
     assert_eq!(parse_status(&raw), 400, "direct server_url should be rejected");
     let response_body = parse_body(&raw);
     assert!(
-        response_body.contains("direct server_url is not allowed"),
+        response_body.contains("Use an administrator-configured connector_id instead."),
         "response: {response_body}"
     );
     for server in [&connector_server, &direct_server] {

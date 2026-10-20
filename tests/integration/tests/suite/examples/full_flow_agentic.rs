@@ -2422,7 +2422,7 @@ fn full_flow_mcp_connector_only_assertion_reaches_discovery_and_call() {
     );
     assert_eq!(parse_status(&raw), 400, "direct server_url must be rejected: {raw}");
     assert!(
-        parse_body(&raw).contains("direct server_url is not allowed"),
+        parse_body(&raw).contains("Use an administrator-configured connector_id instead."),
         "direct server_url rejection should be bounded and client-visible"
     );
     assert!(

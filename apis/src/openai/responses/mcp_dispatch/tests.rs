@@ -2509,7 +2509,14 @@ async fn require_approval_never_missing_assertion_fails_closed_as_streaming_sse_
     let dispatch_filter = make_scoped_dispatch_filter();
     let loop_filter = AgenticLoopFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
+    assert!(
+        matches!(
+            crate::callout_identity::stage_mcp_callout_identity(&ctx, None, Some("mcp_gateway")),
+            Err(crate::callout_identity::McpCalloutContextMissing::Authorization)
+        ),
+        "the trusted owner must be present so only the missing assertion blocks dispatch"
+    );
 
     let mut tool_map = HashMap::new();
     tool_map.insert(

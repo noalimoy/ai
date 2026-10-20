@@ -6974,7 +6974,10 @@ class TestAgenticLoopVLLM:
             )
 
         assert exc_info.value.status_code == 400, exc_info.value
-        assert "direct server_url is not allowed" in str(exc_info.value)
+        assert exc_info.value.body["message"] == (
+            "Direct MCP server URLs are disabled by your administrator. "
+            "Use an administrator-configured connector_id instead."
+        )
         assert MCPHandler.request_count() == requests_before, (
             "connector-only rejection must happen before any MCP request"
         )

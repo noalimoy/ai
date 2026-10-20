@@ -817,7 +817,9 @@ pub(crate) enum ResolveError {
 
     /// A direct client-selected `server_url` was supplied while connector-only
     /// routing is enabled.
-    #[error("direct server_url is not allowed when require_connector is true")]
+    #[error(
+        "Direct MCP server URLs are disabled by your administrator. Use an administrator-configured connector_id instead."
+    )]
     DirectServerUrl,
 
     /// Both `connector_id` and `server_url` were provided.
