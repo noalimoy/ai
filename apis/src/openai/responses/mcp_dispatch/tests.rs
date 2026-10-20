@@ -2705,6 +2705,7 @@ async fn require_approval_never_missing_assertion_fails_closed_as_streaming_sse_
     let loop_filter = AgenticLoopFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.insert(ClientResponseHeadersCommitted);
     assert!(
         matches!(
             crate::callout_identity::stage_mcp_callout_identity(&ctx, None, Some("mcp_gateway")),
@@ -2731,12 +2732,15 @@ async fn require_approval_never_missing_assertion_fails_closed_as_streaming_sse_
     }));
     state.mcp_connector_context_policy = McpConnectorContextPolicy::new(None, Some("mcp_gateway"));
     state.mcp_tool_map = tool_map;
-    state.tool_calls = vec![json!({
-        "type": "function_call",
-        "name": encode_function_name("weather", "get_weather"),
-        "call_id": "call_1",
-        "arguments": "{}"
-    })];
+    state.select_test_output(
+        "function_call",
+        vec![json!({
+            "type": "function_call",
+            "name": encode_function_name("weather", "get_weather"),
+            "call_id": "call_1",
+            "arguments": "{}"
+        })],
+    );
     ctx.extensions.insert(state);
 
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));

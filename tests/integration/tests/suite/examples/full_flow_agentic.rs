@@ -2372,7 +2372,7 @@ fn full_flow_mcp_connector_only_assertion_reaches_discovery_and_call() {
         &json_post_with_mcp_context(
             "/v1/responses",
             &request.to_string(),
-            "Bearer integration-mcp-key",
+            "integration-mcp-key",
             "Bearer integration-mcp-assertion",
         ),
     );
@@ -2382,10 +2382,21 @@ fn full_flow_mcp_connector_only_assertion_reaches_discovery_and_call() {
     let assertion_values: Vec<&str> = ["initialize", "tools/list", "tools/call"]
         .into_iter()
         .map(|method| {
-            requests
+            let request = requests
                 .iter()
                 .find(|request| request.json_rpc_method.as_deref() == Some(method))
-                .unwrap_or_else(|| panic!("configured connector should receive {method}"))
+                .unwrap_or_else(|| panic!("configured connector should receive {method}"));
+            let authorization = request
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                .map(|(_, value)| value.as_str());
+            assert_eq!(
+                authorization,
+                Some("Bearer integration-mcp-key"),
+                "{method} should carry the caller's bearer credential"
+            );
+            request
                 .headers
                 .iter()
                 .find(|(name, _)| name.eq_ignore_ascii_case("x-mcp-authorized"))
@@ -2416,7 +2427,7 @@ fn full_flow_mcp_connector_only_assertion_reaches_discovery_and_call() {
         &json_post_with_mcp_context(
             "/v1/responses",
             &direct_request.to_string(),
-            "Bearer integration-mcp-key",
+            "integration-mcp-key",
             "Bearer integration-mcp-assertion",
         ),
     );
