@@ -7693,7 +7693,7 @@ class TestAgenticLoopVLLM:
             "the operator floor must stop dispatch before the MCP server is called"
         )
 
-    def test_mcp_connector_identity_is_bearer_and_not_forwarded_to_model(
+    def test_mcp_connector_identity_is_bearer_and_not_exposed_in_response(
         self,
         agentic_client,
         agentic_proxy,
