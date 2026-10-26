@@ -92,6 +92,7 @@ filter_chains:
                     key: api-key
                     strategy: apikey
                     header: x-api-key
+                    # Synthetic fixture token only; use env_var or file in deployments.
                     value: anthropic-fixture-key
               - filter: load_balancer
                 clusters:

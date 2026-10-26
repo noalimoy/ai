@@ -14,6 +14,9 @@ use serde_json::{Value, json};
 
 const EXAMPLE: &str = "inference/fallback-with-provider-translation.yaml";
 const RELATIVE_OVERLAY: &str = "tests/integration/fixtures/inference/routing/openai-to-anthropic.json";
+// Keep the checked-in fixture path compile-time validated while the example
+// config retains a relative path for standalone use.
+const _: &str = include_str!("../../../fixtures/inference/routing/openai-to-anthropic.json");
 
 const ANTHROPIC_JSON: &str = r#"{"type":"message","id":"msg_fallback","role":"assistant","model":"claude-fixture-model","content":[{"type":"text","text":"anthropic fallback"}],"stop_reason":"end_turn","usage":{"input_tokens":7,"output_tokens":5}}"#;
 const ANTHROPIC_EVENTS: &str = concat!(
