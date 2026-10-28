@@ -36,7 +36,7 @@ const ANTHROPIC_EVENTS: &str = concat!(
     "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
     "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 );
-const OPENAI_JSON: &str = r#"{"id":"chatcmpl-primary","object":"chat.completion","model":"fixture-openai-model","choices":[{"index":0,"message":{"role":"assistant","content":"openai primary"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#;
+const OPENAI_JSON: &str = r#"{"id":"chatcmpl-primary","object":"chat.completion","created":1,"model":"fixture-openai-model","choices":[{"index":0,"message":{"role":"assistant","content":"openai primary"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#;
 
 #[test]
 fn openai_primary_failure_fails_over_to_translated_anthropic() {
@@ -201,7 +201,7 @@ fn openai_primary_failure_fails_over_to_translated_anthropic_stream() {
 fn openai_primary_stream_reaches_client_before_upstream_completes() {
     let (openai_port, first_sent, release, backend_thread) = start_gated_sse_backend(
         vec![
-            "data: {\"id\":\"chatcmpl-primary-stream\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture-openai-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"primary\"}}]}\n\n"
+            "data: {\"id\":\"chatcmpl-primary-stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"fixture-openai-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"primary\"},\"finish_reason\":null}]}\n\n"
                 .to_owned(),
         ],
         vec!["data: [DONE]\n\n".to_owned()],

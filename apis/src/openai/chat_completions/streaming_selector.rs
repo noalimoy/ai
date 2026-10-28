@@ -159,10 +159,16 @@ mod tests {
                 .on_request_body(&mut buffered_ctx, &mut buffered_body, true)
                 .await
                 .unwrap();
-            assert!(matches!(action, FilterAction::Release));
+            assert!(
+                matches!(action, FilterAction::Release),
+                "selector should release buffered body: {}",
+                String::from_utf8_lossy(body)
+            );
             assert_eq!(
                 buffered_ctx.subrequest_response_mode(),
-                SubRequestResponseMode::Buffered
+                SubRequestResponseMode::Buffered,
+                "selector chose the wrong response mode for body: {}",
+                String::from_utf8_lossy(body)
             );
         }
 
