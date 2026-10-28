@@ -7,21 +7,24 @@
 # against the Anthropic fallback with full request and response translation.
 # The client continues to speak OpenAI Chat Completions.
 #
-# The primary step is a plain OpenAI Chat Completions passthrough. The
+# The primary step preserves OpenAI Chat Completions bytes and selects the
+# typed IRR streaming transport when the client requests `stream: true`. The
 # fallback step composes the trusted provider profile pipeline:
 #
-#   1. model_to_header promotes the client model so intelligent_route can
+#   1. openai_chat_completions_streaming_selector selects typed IRR streaming
+#      from the client request before the fallback translates it
+#   2. model_to_header promotes the client model so intelligent_route can
 #      resolve the candidate (the IRR resets per-step request state, so the
 #      header must be set inside the step that consumes it)
-#   2. intelligent_route binds the Anthropic candidate from a versioned
+#   3. intelligent_route binds the Anthropic candidate from a versioned
 #      overlay (api format, path, target model, credential reference)
-#   3. openai_chat_completions_to_anthropic_stream converts successful
+#   4. openai_chat_completions_to_anthropic_stream converts successful
 #      Anthropic SSE responses incrementally to OpenAI Chat Completions SSE
-#   4. openai_chat_completions_to_anthropic rewrites the request path and
+#   5. openai_chat_completions_to_anthropic rewrites the request path and
 #      body to Anthropic Messages, and converts non-streaming responses back
 #      to OpenAI Chat Completions
-#   5. credential_inject injects the selected Anthropic API key
-#   6. load_balancer selects the fallback endpoint
+#   6. credential_inject injects the selected Anthropic API key
+#   7. load_balancer selects the fallback endpoint
 #
 # Each IRR step starts from the original client request, so the fallback
 # step re-translates from the canonical Chat Completions body rather than
@@ -46,6 +49,8 @@ filter_chains:
         steps:
           - name: primary
             filters:
+              # Select typed IRR streaming for a client stream: true request.
+              - filter: openai_chat_completions_streaming_selector
               - filter: router
                 routes:
                   - path_prefix: "/"
@@ -70,6 +75,9 @@ filter_chains:
 
           - name: anthropic-fallback
             filters:
+              # The fallback replays the original request, so it independently
+              # selects typed IRR streaming for stream: true.
+              - filter: openai_chat_completions_streaming_selector
               # The IRR resets per-step request state, so the model header
               # must be promoted inside this step for intelligent_route.
               - filter: model_to_header
